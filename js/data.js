@@ -157,9 +157,12 @@ var COUNT = { STRIKE_OUT: 2, BALL_WALK: 2, WALK_BASE: 2, WALK_LIVES: 2 };
    ZONE_TIME : 칸 선택 제한(구질을 고른 뒤 새로 센다). 넘기면 무작위 칸
    BASE_TIME : 보통 구속의 비행 시간. 카드마다 timeMul 을 곱하고, 투구마다 ±SPEED_RANDOM
    BREAK_AT  : 변화구는 비행 이 지점부터 도착 칸으로 휜다. 일찍 휘어야 방향을 눈으로 읽는다 (막판 반응 싸움이 되지 않게)
-   BREAK_BOW : 휘기 시작할 때 시작 칸 바깥으로 부푸는 정도 (한 칸 이동 거리 대비). 화면 연출만, 판정과 무관
+   BREAK_BOW : 휘기 시작할 때 시작 칸 바깥으로 부푸는 정도 (한 칸 이동 거리 대비)
+   BREAK_BOW_SPAN : 휘는 구간 중 앞쪽 이 비율 동안만 부풀었다가 돌아온다
+   공은 멀리 있을수록 화면에서 작게 움직이므로 월드 기준으로 크게 휘어야 중반부터 보인다. 화면 연출만, 판정과 무관
    SWING_GRACE : 공이 도착한 뒤 이만큼 기다렸다가 무스윙으로 판정한다 */
-var PITCH = { PICK_TIME: 3.0, ZONE_TIME: 3.0, BASE_TIME: 1.15, BREAK_AT: 0.25, BREAK_BOW: 0.35, SWING_GRACE: 0.24, SPEED_RANDOM: 0.08, RESULT_TIME: 1.0 };
+var PITCH = { PICK_TIME: 3.0, ZONE_TIME: 3.0, BASE_TIME: 1.15, BREAK_AT: 0.10, BREAK_BOW: 1.0, BREAK_BOW_SPAN: 0.5,
+              SWING_GRACE: 0.24, SPEED_RANDOM: 0.08, RESULT_TIME: 1.0 };
 
 /* ---------- 투구 카드 (v2 5장) ----------
    move : 수비자(투수 시점) 화면 기준 이동. dc +1 = 오른쪽, dr +1 = 아래. 'DIAGONAL' = 대각선 반대 칸.
@@ -173,7 +176,7 @@ var PITCH_CARDS = {
   P3: { id: 'P3', name: '낙차 포크',      move: { dc: 0, dr: 1 },  timeMul: 1.00, cost: 1, speed: '보통' },
   P4: { id: 'P4', name: '라이징',         move: { dc: 0, dr: -1 }, timeMul: 1.00, cost: 1, speed: '보통' },
   P5: { id: 'P5', name: '대각 커브',      move: 'DIAGONAL',        timeMul: 1.13, cost: 2, speed: '느림' },
-  P6: { id: 'P6', name: '강속구',         move: null,              timeMul: 0.65, cost: 2, speed: '매우 빠름' }
+  P6: { id: 'P6', name: '강속구',         move: null,              timeMul: 0.52, cost: 2, speed: '매우 빠름' }
 };
 
 var PITCH_DECK = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6'];

@@ -347,6 +347,9 @@ var Scene3D = (function () {
   function swing() { swingT = 0; }
 
   /* pitch: { startCell, endCell, breaking, dur, t } — 변화구는 비행 BREAK_AT 지점부터 도착 칸으로 휜다.
+     휘기 시작하면 시작 칸 바깥으로 한 번 부풀었다가(BREAK_BOW) 도착 칸으로 크게 휘어 들어온다.
+     bend = smoothstep(k) - BOW·sin²(π·k/SPAN) (k < SPAN 동안만) — 부풂은 양 끝에서 0 이라 도착 칸은 그대로다.
+     휘는 양은 릴리스 수렴(ease)에 곱하지 않는다. 곱하면 공이 멀리 있는 동안 휨이 눌려 막판에만 보인다.
      볼은 존 밖 칸 위치로 빠진다. */
   function setPitch(pitch) {
     var p = pitch.t / pitch.dur;
@@ -356,13 +359,14 @@ var Scene3D = (function () {
     var bend = 0;
     if (pitch.breaking && p > PITCH.BREAK_AT) {
       var k = Math.min(1, (p - PITCH.BREAK_AT) / (1 - PITCH.BREAK_AT));
-      bend = k * k * (3 - 2 * k);
+      var bow = Math.sin(Math.PI * Math.min(1, k / PITCH.BREAK_BOW_SPAN));
+      bend = k * k * (3 - 2 * k) - PITCH.BREAK_BOW * bow * bow;
     }
-    var tx = s.x + (e.x - s.x) * bend;
-    var ty = s.y + (e.y - s.y) * bend;
     var ease = Math.pow(p, 0.7);
     pitchBall.visible = true;
-    pitchBall.position.set(tx * ease, 1.80 + (ty - 1.80) * ease, -18.2 + (18.2 + ZONE_Z) * p);
+    pitchBall.position.set(s.x * ease + (e.x - s.x) * bend,
+                           1.80 + (s.y - 1.80) * ease + (e.y - s.y) * bend,
+                           -18.2 + (18.2 + ZONE_Z) * p);
     var sc = 0.9 + p * 0.5;
     pitchBall.scale.set(sc, sc, sc);
   }
