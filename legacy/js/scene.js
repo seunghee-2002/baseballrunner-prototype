@@ -1,18 +1,18 @@
 /* =============================================================
    scene.js — three.js 렌더링 계층
    프리미티브 도형만 쓴다. 캐릭터 3D 애니메이션은 만들지 않는다 (§26).
-   장애물은 스냅숏의 distance 값 하나를 좌표로 환산한다 (§25).
-   공격자·수비자 화면이 같은 함수로 같은 장면을 그린다.
+   장애물 접근은 distance 값 하나를 좌표로 환산해 처리한다 (§25).
    ============================================================= */
 
 var Scene3D = (function () {
 
   var renderer, scene, camera;
-  var player, lean, hipL, hipR, armL, armR, batPivot, aura;
-  var laneMarks = [], pitcher, pitchBall, mound, strikeZone, baseMarker;
+  var player, lean, hipL, hipR, armL, armR, batPivot;
+  var laneMarks = [], pitcher, pitchBall, mound, hitRing, approachRing;
+  var strikeZone, baseMarker;
   var boost = 0;            // 베이스를 밟고 지나갈 때의 짧은 속도감
 
-  /* 스트라이크존 4칸의 중심 — 화면 4분할과 같은 배치 (§8) */
+  /* 스트라이크존 4칸의 중심 — 공은 이 중 한 곳으로 들어온다 (§8 의 4분면과 같은 배치) */
   var ZONE_POINT = {
     LT: { x: -0.19, y: 1.43 },
     RT: { x:  0.19, y: 1.43 },
@@ -20,14 +20,16 @@ var Scene3D = (function () {
     RB: { x:  0.19, y: 1.07 }
   };
   var ZONE_Z = 0.55;
+  var obstacles = [];       // { mesh, step, distance } 참조용 (게임 로직은 game.js 소유)
 
   var mode = 'bat';
-  var runSpeed = 0;
+  var runSpeed = 0;         // 배경 스크롤 속도 (연출용)
   var runPhase = 0;
   var shakeAmt = 0;
-  var flyBall = null;
-  var baseX = 0;
+  var flyBall = null;       // 타격 후 날아가는 공
+  var baseX = 0;            // 모드별 플레이어 기본 x 위치
 
+  /* 회피 포즈 목표값. 매 프레임 현재값을 목표로 보간한다. */
   var pose = { leanZ: 0, offX: 0, legL: 0, legR: 0, crouch: 0 };
   var cur  = { leanZ: 0, offX: 0, legL: 0, legR: 0, crouch: 0 };
   var poseTimer = 0;
@@ -37,7 +39,8 @@ var Scene3D = (function () {
   var camPosTarget = camPos.clone();
   var camLookTarget = camLook.clone();
 
-  /* 4분면 -> 3D 위치. 멀리서는 화면 네 귀퉁이에 넓게, 가까워지면 몸으로 수렴한다. */
+  /* ---------- 스폰 오프셋 (§8 4분면 -> 3D 위치) ----------
+     멀리서는 화면 네 귀퉁이에 넓게, 가까워지면 플레이어 몸으로 수렴한다. */
   var SPAWN = {
     LT: { from: { x: -3.6, y: 3.15 }, to: { x: -0.28, y: 1.42 } },
     RT: { from: {  x: 3.6, y: 3.15 }, to: {  x: 0.28, y: 1.42 } },
@@ -46,11 +49,6 @@ var Scene3D = (function () {
   };
 
   var Z_PER_DIST = 0.42;    // distance 100 -> z 약 -42
-  var SWITCH_TIME = 0.18;   // C03·C04 가 옆 칸으로 옮겨가는 데 걸리는 시간 — 순간이동하면 눈으로 못 따라간다
-
-  var GLOW = { ball: 0xffe14d, fielder: 0xff5a4d, fan: 0x7ef2c0, card: 0xff7a1a };
-
-  var obMeshes = {};        // 스냅숏 장애물 id -> mesh
 
   /* ---------------------------------------------------------- */
 
@@ -62,11 +60,8 @@ var Scene3D = (function () {
     return new THREE.Mesh(new THREE.SphereGeometry(r, seg || 14, seg || 12),
       new THREE.MeshLambertMaterial({ color: color }));
   }
-  function glowSphere(r, color, opacity) {
-    return new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8),
-      new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: opacity }));
-  }
 
+  /* 사람 형상 하나. 프리미티브 조합일 뿐이다. */
   function makeHuman(uniform, skin, helmet) {
     var g = new THREE.Group();
     var t = box(0.52, 0.74, 0.30, uniform); t.position.y = 1.15; g.add(t);
@@ -93,20 +88,16 @@ var Scene3D = (function () {
     return sh;
   }
 
-  function disposeTree(obj) {
-    obj.traverse(function (n) {
-      if (n.geometry) n.geometry.dispose();
-      if (n.material) n.material.dispose();
-    });
-  }
-
   /* ---------------------------------------------------------- */
 
   function buildPlayer() {
     player = new THREE.Group();
 
-    lean = new THREE.Group();
-    lean.add(makeHuman(0xf2f4f8, 0xe8b48c, 0x1f4fd8));
+    lean = new THREE.Group();            // 상체 회피용 피벗
+    lean.position.y = 0;
+    var body = makeHuman(0xf2f4f8, 0xe8b48c, 0x1f4fd8);
+    lean.add(body);
+
     armL = makeArm(-0.35, 0xf2f4f8);
     armR = makeArm(0.35, 0xf2f4f8);
     lean.add(armL); lean.add(armR);
@@ -119,6 +110,7 @@ var Scene3D = (function () {
     batPivot.add(bat);
     batPivot.rotation.y = -0.9;
     lean.add(batPivot);
+
     player.add(lean);
 
     hipL = makeLeg(-0.15, 0x2a3350);
@@ -130,13 +122,6 @@ var Scene3D = (function () {
     sh.rotation.x = -Math.PI / 2;
     sh.position.y = 0.03;
     player.add(sh);
-
-    /* 피버 무적 표시 */
-    aura = glowSphere(1.05, 0xff5ad0, 0.0);
-    aura.position.y = 1.0;
-    aura.scale.y = 1.25;
-    aura.visible = false;
-    player.add(aura);
 
     scene.add(player);
   }
@@ -164,6 +149,7 @@ var Scene3D = (function () {
       laneMarks.push(m);
     }
 
+    /* 멀리 있는 관중석 — fog 로 흐려질 정도의 덩어리만 */
     for (var s = -1; s <= 1; s += 2) {
       var stand = box(10, 6, 120, 0x151b2e);
       stand.position.set(s * 16, 3, -70);
@@ -186,21 +172,39 @@ var Scene3D = (function () {
     pitchBall.visible = false;
     scene.add(pitchBall);
 
-    /* 스트라이크존 4분할 격자 — 타이밍 링은 없다. 공의 궤적만 보고 친다. */
+    /* 스트라이크존 4분할 격자 — 공이 어느 칸으로 오는지 보여야 한다.
+       주루의 4분면과 같은 배치라 손이 헷갈리지 않는다 (§8). */
     strikeZone = new THREE.Group();
     var lineMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.30 });
-    var W = 0.76, H = 0.72, T = 0.014, g;
-    for (g = -1; g <= 1; g++) {
+    var W = 0.76, H = 0.72, T = 0.014;
+    var gy, gx;
+    for (gy = -1; gy <= 1; gy++) {
       var hbar = new THREE.Mesh(new THREE.BoxGeometry(W, T, T), lineMat);
-      hbar.position.set(0, 1.25 + g * (H / 2), 0);
+      hbar.position.set(0, 1.25 + gy * (H / 2), 0);
       strikeZone.add(hbar);
+    }
+    for (gx = -1; gx <= 1; gx++) {
       var vbar = new THREE.Mesh(new THREE.BoxGeometry(T, H, T), lineMat);
-      vbar.position.set(g * (W / 2), 1.25, 0);
+      vbar.position.set(gx * (W / 2), 1.25, 0);
       strikeZone.add(vbar);
     }
     strikeZone.position.z = ZONE_Z;
     scene.add(strikeZone);
 
+    /* 타격 타이밍 큐 — 접근 링이 고정 링과 겹치는 순간이 PERFECT 다.
+       링은 공이 들어올 칸 위에 뜬다: 타이밍과 코스를 한 곳에서 읽게 (§30 Q1). */
+    var ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 });
+    hitRing = new THREE.Mesh(new THREE.TorusGeometry(0.19, 0.022, 8, 24), ringMat);
+    hitRing.position.set(0, 1.25, ZONE_Z + 0.02);
+    scene.add(hitRing);
+
+    approachRing = new THREE.Mesh(new THREE.TorusGeometry(0.19, 0.038, 8, 24),
+      new THREE.MeshBasicMaterial({ color: 0xffe14d, transparent: true, opacity: 0.85 }));
+    approachRing.position.copy(hitRing.position);
+    approachRing.visible = false;
+    scene.add(approachRing);
+
+    /* 베이스 — 주루 중 발밑으로 다가와 지나간다 */
     baseMarker = new THREE.Mesh(new THREE.PlaneGeometry(0.62, 0.62),
       new THREE.MeshBasicMaterial({ color: 0xffffff }));
     baseMarker.rotation.x = -Math.PI / 2;
@@ -229,6 +233,7 @@ var Scene3D = (function () {
 
     scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0x0a1020, 26, 78);
+
     camera = new THREE.PerspectiveCamera(58, 1, 0.1, 400);
 
     buildLights();
@@ -237,6 +242,8 @@ var Scene3D = (function () {
     resize();
   }
 
+  /* 매 프레임 호출해도 되도록 크기가 바뀔 때만 실제로 적용한다.
+     (첫 프레임에 레이아웃이 아직 0 인 경우를 그냥 흡수한다) */
   var lastW = 0, lastH = 0;
   function resize() {
     if (!renderer) return;
@@ -252,31 +259,36 @@ var Scene3D = (function () {
   /* ---------------------------------------------------------- */
 
   function setMode(m) {
-    if (mode === m) return;
     mode = m;
-    var bat = m === 'bat';
-    if (bat) {
+    if (m === 'bat') {
       camPosTarget.set(0, 2.9, 6.4);
       camLookTarget.set(0, 1.5, -14);
+      batPivot.visible = true;
+      pitcher.visible = true;
+      mound.visible = true;
+      hitRing.visible = true;
+      strikeZone.visible = true;
+      baseMarker.visible = false;
       player.rotation.y = 0;
     } else {
       camPosTarget.set(0, 2.55, 4.7);
       camLookTarget.set(0, 1.30, -8);
+      batPivot.visible = false;
+      pitcher.visible = false;
+      mound.visible = false;
+      hitRing.visible = false;
+      approachRing.visible = false;
+      strikeZone.visible = false;
       pitchBall.visible = false;
     }
-    batPivot.visible = bat;
-    pitcher.visible = bat;
-    mound.visible = bat;
-    strikeZone.visible = bat;
-    if (bat) baseMarker.visible = false;
   }
 
-  /* mul: 0 = 멈춤, 1 = 주루, 그 이상 = 피버 돌진 */
-  function setRunning(mul) { runSpeed = 15 * (mul || 0); }
+  function setRunning(on) { runSpeed = on ? 15 : 0; }
 
   /* ---------- 회피 포즈 ----------
-     상체 : 입력한 방향으로 몸을 기울여 피한다.
-     하체 : 입력한 쪽 다리를 들어 태클을 넘긴다. */
+     무엇을 했는지 눈에 보여야 한다 (§37).
+       상체 : 입력한 방향으로 몸을 기울여 피한다.
+       하체 : 입력한 쪽 다리를 들어 태클을 넘긴다. 몸은 반대로 살짝 기울어 균형을 잡는다. */
   function dodge(zone) {
     if (zone === 'LT')      { pose.leanZ =  0.62; pose.offX = -0.45; pose.legL = 0; pose.legR = 0; }
     else if (zone === 'RT') { pose.leanZ = -0.62; pose.offX =  0.45; pose.legL = 0; pose.legR = 0; }
@@ -297,32 +309,40 @@ var Scene3D = (function () {
 
   function shake(a) { shakeAmt = Math.max(shakeAmt, a); }
 
-  function setAura(on) { aura.visible = !!on; }
-
   /* ---------- 타격 ---------- */
 
   var swingT = -1;
   function swing() { swingT = 0; }
 
-  /* pitch: { start, end, type, dur, t } — 변화구는 비행 BREAK_AT 지점부터 도착 칸으로 휜다 */
-  function setPitch(pitch) {
-    var p = Math.min(1.12, pitch.t / pitch.dur);
-    var s = ZONE_POINT[pitch.start], e = ZONE_POINT[pitch.end];
-    var bend = 0;
-    if (pitch.type === 'BREAK' && p > PITCH.BREAK_AT) {
-      var k = Math.min(1, (p - PITCH.BREAK_AT) / (1 - PITCH.BREAK_AT));
-      bend = k * k * (3 - 2 * k);
-    }
-    var tx = s.x + (e.x - s.x) * bend;
-    var ty = s.y + (e.y - s.y) * bend;
+  /* p: 0(릴리스) -> 1(타격 지점), zone: 공이 들어올 스트라이크존 칸 */
+  function setPitch(p, zone) {
+    var t = ZONE_POINT[zone] || ZONE_POINT.LT;
+
+    /* 코스는 일찍 드러나야 한다. 늦게 갈리면 "보고 칠 수 없는" 운이 된다 (§13-3). */
     var ease = Math.pow(p, 0.7);
     pitchBall.visible = true;
-    pitchBall.position.set(tx * ease, 1.80 + (ty - 1.80) * ease, -18.2 + (18.2 + ZONE_Z) * p);
-    var sc = 0.9 + p * 0.5;
-    pitchBall.scale.set(sc, sc, sc);
+    pitchBall.position.set(
+      t.x * ease,
+      1.80 + (t.y - 1.80) * ease,
+      -18.2 + (18.2 + ZONE_Z) * p
+    );
+    var s = 0.9 + p * 0.5;
+    pitchBall.scale.set(s, s, s);
+
+    /* 링은 그 칸 위에 뜬다. 접근 링이 고정 링과 겹치는 순간이 타격 타이밍이다. */
+    hitRing.position.set(t.x, t.y, ZONE_Z + 0.02);
+    approachRing.position.copy(hitRing.position);
+    approachRing.visible = true;
+    var rs = 3.6 + (1.0 - 3.6) * p;
+    if (rs < 0.35) rs = 0.35;
+    approachRing.scale.set(rs, rs, 1);
+    approachRing.material.opacity = Math.min(0.9, 0.25 + p * 0.8);
   }
 
-  function hidePitch() { pitchBall.visible = false; }
+  function hidePitch() {
+    pitchBall.visible = false;
+    approachRing.visible = false;
+  }
 
   function launchHitBall(power) {
     flyBall = {
@@ -331,92 +351,59 @@ var Scene3D = (function () {
       life: 1.6
     };
     pitchBall.visible = true;
+    approachRing.visible = false;
   }
 
   /* ---------- 장애물 (§25) ---------- */
 
-  function makeObstacle(o) {
-    var g = new THREE.Group(), glow;
-    var color = o.card ? GLOW.card : GLOW[o.kind];
-
-    if (o.kind === 'ball') {
-      g.add(ball(0.17, 0xfdfdfd, 14));
-      glow = glowSphere(0.30, color, 0.18);
-    } else if (o.kind === 'fielder') {
-      var body = makeHuman(o.card ? 0x8c2a2a : 0x2a3a8c, 0xe8b48c, 0x101a3a);
+  function addObstacle(step) {
+    var g;
+    if (step.def.type === 'ball') {
+      g = new THREE.Group();
+      var b = ball(0.17, 0xfdfdfd, 14);
+      g.add(b);
+      var glow = new THREE.Mesh(new THREE.SphereGeometry(0.30, 10, 8),
+        new THREE.MeshBasicMaterial({ color: 0xffe14d, transparent: true, opacity: 0.18 }));
+      g.add(glow);
+      g.userData.glow = glow;
+      g.userData.kind = 'ball';
+    } else {
+      g = makeHuman(0x2a3a8c, 0xe8b48c, 0x101a3a);
       var lgl = makeLeg(-0.15, 0x1a234a); lgl.rotation.x = 0.7;
       var lgr = makeLeg(0.15, 0x1a234a); lgr.rotation.x = -0.5;
-      body.add(lgl); body.add(lgr);
-      body.rotation.x = 0.5;                  // 상체가 플레이어 쪽으로 기운 태클 자세
-      g.add(body);
-      glow = glowSphere(0.55, color, 0.12);
-      glow.position.y = 1.1;
-    } else {
-      /* 관객: 위쪽에서 몸을 날려 뛰어든다. 공과 같은 높이지만 사람 모양이라 구분된다. */
-      var fan = makeHuman(0xffc83d, 0xe8b48c, 0xd8286a);
-      fan.position.y = -1.2;
-      var holder = new THREE.Group();
-      holder.add(fan);
-      holder.rotation.z = o.zone === 'LT' ? -Math.PI / 2 : Math.PI / 2;
-      holder.scale.set(0.8, 0.8, 0.8);
-      g.add(holder);
-      glow = glowSphere(0.6, color, 0.14);
+      g.add(lgl); g.add(lgr);
+      g.rotation.x = 0.5;                 // 상체가 플레이어 쪽으로 기운 태클 자세
+      var mark = new THREE.Mesh(new THREE.SphereGeometry(0.55, 10, 8),
+        new THREE.MeshBasicMaterial({ color: 0xff5a4d, transparent: true, opacity: 0.12 }));
+      mark.position.y = 1.1;
+      g.add(mark);
+      g.userData.glow = mark;
+      g.userData.kind = 'fielder';
     }
-    g.add(glow);
-    g.userData.glow = glow;
-    g.userData.kind = o.kind;
+    scene.add(g);
+    obstacles.push(g);
     return g;
   }
 
-  function pathPoint(zone, t) {
-    var sp = SPAWN[zone];
-    var ease = Math.pow(t, 1.25);   // 마지막에 훅 꺾이지 않게 완만하게 수렴
-    return { x: sp.from.x + (sp.to.x - sp.from.x) * ease, y: sp.from.y + (sp.to.y - sp.from.y) * ease };
-  }
-
-  /* distance 0 = 플레이어 몸 중심(z=0) 이어야 눈에 보이는 충돌과 판정이 일치한다 */
-  function place(mesh, o) {
-    var t = Math.max(0, 1 - o.distance / RUN.START_DISTANCE);
-    var p = pathPoint(o.zone, t);
-    if (o.switched) {
-      var k = Math.min(1, Math.max(0, (o.switchDist - o.distance) / (o.speed * SWITCH_TIME)));
-      var q = pathPoint(o.fromZone, t), e = k * k * (3 - 2 * k);
-      p = { x: q.x + (p.x - q.x) * e, y: q.y + (p.y - q.y) * e };
-    }
-    mesh.position.set(p.x, p.y, -o.distance * Z_PER_DIST);
-  }
-
-  /* 스냅숏 장애물 목록과 장면을 맞춘다. 새 id 는 만들고, 사라진 id 는 지운다. */
-  function syncObstacles(list) {
-    var seen = {}, id;
-    for (var i = 0; i < list.length; i++) {
-      var o = list[i];
-      var m = obMeshes[o.id];
-      if (!m) { m = obMeshes[o.id] = makeObstacle(o); scene.add(m); }
-      seen[o.id] = true;
-      place(m, o);
-      if (m.userData.kind === 'ball') { m.rotation.x += 0.25; m.rotation.y += 0.18; }
-
-      /* 유효 창에 들어오면 빛난다 — 지금 누르면 받아진다는 신호 (§37) */
-      var armed = !o.resolved && o.distance > 0 && o.distance / o.speed <= o.window;
-      var gl = m.userData.glow;
-      gl.material.opacity = o.resolved ? 0 : (armed ? (m.userData.kind === 'ball' ? 0.6 : 0.4) : 0.15);
-      var s = armed ? 1.45 : 1;
-      gl.scale.set(s, s, s);
-    }
-    for (id in obMeshes) {
-      if (!seen[id]) {
-        scene.remove(obMeshes[id]);
-        disposeTree(obMeshes[id]);
-        delete obMeshes[id];
-      }
+  /* distance 하나로 위치·크기를 모두 만든다 (§25).
+     distance 0 = 플레이어 몸 중심(z=0) 이어야 눈에 보이는 충돌과 판정이 일치한다. */
+  function placeObstacle(mesh, step, distance) {
+    var sp = SPAWN[step.def.spawn];
+    var t = 1 - distance / RUN.START_DISTANCE;
+    if (t < 0) t = 0;
+    /* 궤적이 마지막에 훅 꺾이면 언제 닿을지 읽을 수 없다. 완만하게 수렴시킨다. */
+    var ease = Math.pow(t, 1.25);
+    mesh.position.x = sp.from.x + (sp.to.x - sp.from.x) * ease;
+    mesh.position.y = sp.from.y + (sp.to.y - sp.from.y) * ease;
+    mesh.position.z = -distance * Z_PER_DIST;
+    if (step.def.type === 'ball') {
+      mesh.rotation.x += 0.25;
+      mesh.rotation.y += 0.18;
     }
   }
 
-  function clearObstacles() { syncObstacles([]); }
-
-  /* ---------- 베이스 ---------- */
-
+  /* ---------- 베이스 ----------
+     progress: 0(구간 시작) -> 1(베이스 통과). 발밑으로 다가온다. */
   function setBaseApproach(progress) {
     if (progress < 0) progress = 0;
     baseMarker.visible = true;
@@ -425,9 +412,28 @@ var Scene3D = (function () {
 
   function hideBase() { baseMarker.visible = false; }
 
+  /* 베이스를 밟고 지나가는 순간 — 짧게만 (§36 의 정신: 연출은 짧게) */
   function passBase() {
     shake(0.30);
     boost = 0.75;
+  }
+
+  /* 입력 유효 창에 들어왔다는 신호 — 지금부터 눌러도 된다는 뜻이다 (§37) */
+  function armObstacle(mesh) {
+    var gl = mesh.userData.glow;
+    if (!gl) return;
+    gl.material.opacity = mesh.userData.kind === 'ball' ? 0.60 : 0.40;
+    gl.scale.set(1.45, 1.45, 1.45);
+  }
+
+  function removeObstacle(mesh) {
+    scene.remove(mesh);
+    var i = obstacles.indexOf(mesh);
+    if (i >= 0) obstacles.splice(i, 1);
+  }
+
+  function clearObstacles() {
+    while (obstacles.length) removeObstacle(obstacles[0]);
   }
 
   function resetPlayer() {
@@ -440,9 +446,7 @@ var Scene3D = (function () {
     boost = 0;
     baseMarker.visible = false;
     batPivot.rotation.y = -0.9;
-    aura.visible = false;
     hidePitch();
-    clearObstacles();
   }
 
   /* ---------------------------------------------------------- */
@@ -450,6 +454,7 @@ var Scene3D = (function () {
   function update(dt) {
     resize();
 
+    /* 포즈 유지 시간이 끝나면 달리기 자세로 복귀 */
     if (poseTimer > 0) {
       poseTimer -= dt;
       if (poseTimer <= 0) clearPose();
@@ -464,10 +469,12 @@ var Scene3D = (function () {
 
     /* 달리기 — sin 스윙과 상하 바운스뿐이다 (§26) */
     var running = runSpeed > 0.1;
-    if (running) runPhase += dt * 11 * Math.max(1, runSpeed / 15);
+    if (running) runPhase += dt * 11;
     var sw = running ? Math.sin(runPhase) : 0;
     var bounce = running ? Math.abs(Math.sin(runPhase)) * 0.055 : 0;
 
+    /* 다리를 드는 동안에는 그 다리의 달리기 스윙을 죽이고 무릎을 앞·옆으로 올린다.
+       rotation.x 양수 = 발이 진행 방향(-z)으로, rotation.z 는 바깥쪽으로 벌린다. */
     hipL.rotation.x = sw * 0.85 * (1 - cur.legL) + cur.legL * 1.00;
     hipR.rotation.x = -sw * 0.85 * (1 - cur.legR) + cur.legR * 1.00;
     hipL.rotation.z = -cur.legL * 1.15;
@@ -488,10 +495,10 @@ var Scene3D = (function () {
     lean.rotation.z = cur.leanZ;
     lean.position.y = bounce - cur.crouch * 0.5;
     player.position.x = baseX + cur.offX;
+    /* 다리를 들면 몸이 살짝 떠오른다 — 태클을 넘는 그림 */
     player.position.y = -cur.crouch * 0.25 + Math.max(cur.legL, cur.legR) * 0.14;
 
-    if (aura.visible) aura.material.opacity = 0.16 + Math.abs(Math.sin(runPhase * 0.5)) * 0.14;
-
+    /* 스윙 */
     if (swingT >= 0) {
       swingT += dt;
       var p = Math.min(1, swingT / 0.28);
@@ -500,6 +507,7 @@ var Scene3D = (function () {
       if (swingT > 0.62) { swingT = -1; batPivot.rotation.y = -0.9; lean.rotation.y = 0; }
     }
 
+    /* 배경 스크롤 — 베이스를 밟은 직후 잠깐 빨라진다 */
     if (boost > 0.001) boost *= Math.pow(0.02, dt);
     if (running) {
       var scrollSpeed = runSpeed * (1 + boost);
@@ -510,6 +518,7 @@ var Scene3D = (function () {
       }
     }
 
+    /* 타격된 공 */
     if (flyBall) {
       flyBall.vel.y -= 18 * dt;
       flyBall.pos.addScaledVector(flyBall.vel, dt);
@@ -518,6 +527,7 @@ var Scene3D = (function () {
       if (flyBall.life <= 0) { flyBall = null; pitchBall.visible = false; }
     }
 
+    /* 카메라 */
     var ck = Math.min(1, dt * 4.5);
     camPos.lerp(camPosTarget, ck);
     camLook.lerp(camLookTarget, ck);
@@ -534,10 +544,11 @@ var Scene3D = (function () {
 
   return {
     init: init, resize: resize, setMode: setMode, setRunning: setRunning,
-    dodge: dodge, hitReaction: hitReaction, shake: shake, setAura: setAura,
+    dodge: dodge, hitReaction: hitReaction, shake: shake,
     swing: swing, setPitch: setPitch, hidePitch: hidePitch, launchHitBall: launchHitBall,
-    syncObstacles: syncObstacles, clearObstacles: clearObstacles,
+    addObstacle: addObstacle, placeObstacle: placeObstacle, armObstacle: armObstacle,
     setBaseApproach: setBaseApproach, hideBase: hideBase, passBase: passBase,
+    removeObstacle: removeObstacle, clearObstacles: clearObstacles,
     resetPlayer: resetPlayer, update: update, render: render
   };
 })();

@@ -3,8 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Baseball Action Runner PvP — Prototype</title>
-<link rel="icon" href="data:,">
+<title>Baseball Action Runner — Prototype</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,49 +11,36 @@
 <div id="stage">
   <canvas id="gl"></canvas>
 
-  <!-- 4분할 입력 영역 (§8) : 버튼 그래픽이 아니라 화면 영역 그 자체가 입력이다 -->
+  <!-- 4분할 대응 영역 (§8) : 버튼 그래픽이 아니라 화면 영역 그 자체가 입력이다 -->
   <div id="zones">
     <div class="zone" data-zone="LT"><span class="zone-arrow">&#8598;</span></div>
     <div class="zone" data-zone="RT"><span class="zone-arrow">&#8599;</span></div>
     <div class="zone" data-zone="LB"><span class="zone-arrow">&#8601;</span></div>
     <div class="zone" data-zone="RB"><span class="zone-arrow">&#8600;</span></div>
   </div>
-  <div id="hintLayer"></div>
-  <div id="pickLayer"></div>
-
-  <!-- C08 시야 흙먼지 — 공격자 화면에만 -->
-  <div id="dust"></div>
 
   <!-- HUD (§22, §23) -->
   <div id="hud">
     <div class="hud-top">
-      <div id="scoreBox"><b id="scoreMe">0</b><span id="scoreSep"></span><b id="scoreOpp"></b></div>
-      <div id="inning"></div>
+      <div id="score">SCORE 0</div>
       <div id="outs">OUT <i></i><i></i><i></i></div>
     </div>
-    <div id="roleTag"></div>
     <div id="chance">READY</div>
-    <div id="gaugeWrap"><div id="gaugeFill"></div></div>
+    <div id="gaugeWrap">
+      <div id="gaugeFill"></div>
+      <div id="gaugeEdge"></div>
+    </div>
     <div id="gaugeHint">RUN GAUGE</div>
-    <div id="feverWrap"><div id="feverFill"></div></div>
     <div id="baseTrack"></div>
+    <div id="progress"></div>
     <div id="combo"></div>
-    <div id="stageInfo"></div>
-    <div id="waitInfo"></div>
-  </div>
-
-  <!-- 피버 발동: 가득 찼을 때만 뜬다. 이 영역만 회피 입력에서 빠진다. -->
-  <button id="feverBtn" type="button" hidden>FEVER</button>
-
-  <!-- 수비자 손패 (8장 덱 중 4장) -->
-  <div id="defBar" hidden>
-    <div id="costBox">COST <b id="costNum">0</b><span id="lockInfo"></span></div>
-    <div id="hand"></div>
+    <div id="stageInfo">AT BAT 1 &middot; Lv.1</div>
   </div>
 
   <div id="flash"></div>
   <div id="callout"></div>
   <div id="subCallout"></div>
+  <div id="hintLayer"></div>
 
   <div id="overlay"></div>
 
@@ -65,11 +51,6 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="js/data.js"></script>
-<script src="js/match.js"></script>
-<script src="js/net.js"></script>
-<script src="js/attack.js"></script>
-<script src="js/defense.js"></script>
-<script src="js/bot.js"></script>
 <script src="js/scene.js"></script>
 <script src="js/ui.js"></script>
 <script src="js/game.js"></script>
