@@ -1,21 +1,18 @@
 /* =============================================================
    attack.js — 공격 쪽 규칙 (사람 타자·봇 타자 공용, DOM 없음)
-   한 타석: WAIT_PITCH -> PITCH -> BAT_RESULT -> CHANCE -> RUNNING -> (HR_RUN) -> OUTRO -> DONE
-   타격 시점에 결과를 확정하지 않는다. CHANCE 를 만들고 주루로 확정한다 (§3, §43).
+   한 타석: WAIT_PITCH -> PITCH -> BAT_RESULT -> (WAIT_PITCH 다시 | RUNNING | 삼진 DONE)
+            RUNNING -> 홈 도착 DONE / 생명 0 OUTRO -> DONE
+   타격은 생명 수를 주고, 주루는 생명이 다할 때까지 이어진다. 어디까지 갔느냐가 점수다.
    화면은 snapshot() 의 events 를 읽어 연출한다 — 공격자 화면과 수비자 화면이 같은 길을 쓴다.
    ============================================================= */
 
 var AttackSim = (function () {
 
-  var PHASE_TIME = { BAT_RESULT: 1.0, CHANCE: 1.15, OUTRO: 0.75 };
   var EVENT_KEEP = 16;
 
-  /* opts: { seq, atBat, level, outs, emit(type, payload), rng, debug } */
+  /* opts: { seq, emit(type, payload), rng, debug } */
   function AttackSim(opts) {
     this.seq = opts.seq;
-    this.atBat = opts.atBat;
-    this.level = opts.level;
-    this.outs = opts.outs || 0;
     this.emit = opts.emit || function () {};
     this.rng = opts.rng || Math.random;
     this.debug = opts.debug || {};
@@ -25,31 +22,32 @@ var AttackSim = (function () {
     this.clock = 0;
 
     this.pitch = null;
+    this.pitchNo = 0;
+    this.queuedPitch = null;
     this.swung = false;
     this.bat = null;
+    this.strikes = 0;
+    this.balls = 0;
 
-    /* chance 는 타격이 정한 목표, base 는 실제로 밟고 지나간 베이스 수 */
-    this.chance = 0;
-    this.fast = false;
+    this.lives = 0;
+    this.livesStart = 0;
+    this.boostLegs = 0;
     this.base = 0;
-    this.hrFrom = 0;
-
-    this.gauge = RUN.GAUGE_START;
-    this.fever = 0;
-    this.combo = 0;
+    this.startBase = 0;
     this.stiff = 0;
-    this.invincible = 0;
     this.dust = 0;
 
     this.leg = null;
+    this.nextPlan = null;
     this.obstacles = [];
-    this.pending = [];
+    this.pending = [];       // 카드 장애물 출발 대기
+    this.warnings = [];      // 경고 중인 교란 카드
     this.nextId = 1;
 
     this.events = [];
     this.eventId = 0;
     this.result = null;
-    this.stats = { success: 0, total: 0, perfect: 0, bestCombo: 0 };
+    this.stats = { success: 0, total: 0, perfect: 0 };
   }
 
   var P = AttackSim.prototype;
@@ -64,16 +62,21 @@ var AttackSim = (function () {
 
   /* ---------------- 투구 · 타격 ---------------- */
 
-  /* 수비자의 2단계 터치. 같은 칸 = 직구, 다른 칸 = 시작 칸에서 도착 칸으로 휘는 변화구 */
+  /* p: { pitchNo, cardId(직구 null), start(타자 시점 칸), speedMul, timeout } */
   P.onPitch = function (p) {
-    if (this.phase !== 'WAIT_PITCH') return;
-    var start = NUM_ZONE[p.startPos] || 'LT';
-    var end = NUM_ZONE[p.endPos] || start;
-    var type = start === end ? 'FAST' : 'BREAK';
-    var dur = LEVELS[this.level].pitchTime * (type === 'FAST' ? PITCH.FASTBALL_MUL : 1);
-    this.pitch = { start: start, end: end, type: type, dur: dur, t: 0 };
+    if (p.pitchNo !== this.pitchNo + 1) return;
+    if (this.phase === 'BAT_RESULT') { this.queuedPitch = p; return; }
+    if (this.phase !== 'WAIT_PITCH' || !ZONE_CELL[p.start]) return;
+
+    var path = pitchPath(p.cardId || null, p.start);
+    var card = pitchCard(p.cardId || null);
+    this.pitchNo = p.pitchNo;
+    this.pitch = {
+      cardId: p.cardId || null, start: path.start, end: path.end, startCell: path.startCell, endCell: path.endCell,
+      ball: path.ball, breaking: path.breaking, dur: PITCH.BASE_TIME * card.timeMul * (p.speedMul || 1), t: 0
+    };
     this.swung = false;
-    this.pushEvent({ type: 'pitch', pitchType: type });
+    this.pushEvent({ type: 'pitch', cardId: this.pitch.cardId });
     this.setPhase('PITCH');
   };
 
@@ -85,43 +88,48 @@ var AttackSim = (function () {
   };
 
   /* 쳐야 할 칸은 도착 칸이다.
-     정확한 칸 = 타이밍 등급 / 옆 칸 = 빗맞은 1B, 그중 일부 LUCKY / 대각선 반대·타이밍 실패 = MISS */
+     볼: 스윙하지 않으면 볼, 스윙하면 스트라이크.
+     스트라이크 존: 도착 칸 = 타이밍 등급 / 옆 칸 = 파울(25% LUCKY) / 대각선 반대·타이밍 실패·무스윙 = 스트라이크 */
   P.judgeBat = function (err, zone, noSwing) {
-    var w = null, i;
-    if (!noSwing) {
+    var pt = this.pitch, w = null, i;
+    var bat = { grade: 'STRIKE', reason: '', zone: zone || null, end: pt.end, ball: pt.ball, lives: 0, boostLegs: 0 };
+
+    if (pt.ball) {
+      if (noSwing) bat.grade = 'BALL';
+      else bat.reason = 'BALL_SWING';
+    } else if (noSwing) {
+      bat.reason = 'NO_SWING';
+    } else {
       for (i = 0; i < BAT_WINDOWS.length; i++) {
         if (err <= BAT_WINDOWS[i].err) { w = BAT_WINDOWS[i]; break; }
       }
-    }
-    var end = this.pitch.end;
-    var bat = { grade: 'MISS', zone: zone || null, end: end, chance: 0, mishit: false, lucky: false, reason: '' };
-
-    if (w && zone === OPPOSITE_ZONE[end]) { w = null; bat.reason = 'DIAGONAL'; }
-
-    if (!w) {
-      if (!bat.reason) bat.reason = noSwing ? 'NO_SWING' : (this.pitch.t < this.pitch.dur ? 'EARLY' : 'LATE');
-    } else if (zone !== end) {
-      bat.mishit = true;
-      if (this.rng() < LUCKY.RATE) {
-        bat.lucky = true;
-        bat.grade = 'LUCKY';
-        bat.chance = LUCKY.CHANCES[Math.floor(this.rng() * LUCKY.CHANCES.length)];
+      if (!w) bat.reason = pt.t < pt.dur ? 'EARLY' : 'LATE';
+      else if (zone === OPPOSITE_ZONE[pt.end]) bat.reason = 'DIAGONAL';
+      else if (zone !== pt.end) {
+        if (this.rng() < LUCKY.RATE) { bat.grade = 'LUCKY'; bat.lives = LUCKY.LIVES; }
+        else bat.reason = 'FOUL';
       } else {
-        bat.grade = 'GOOD';
-        bat.chance = 1;
+        bat.grade = w.grade;
+        bat.lives = w.lives;
+        bat.boostLegs = w.boostLegs;
       }
-      this.gauge = RUN.GAUGE_START;
-    } else {
-      bat.grade = w.grade;
-      bat.chance = w.chance;
-      this.gauge = w.gauge;       // JUST 는 게이지를 높이 들고 출발한다
-      this.fast = w.fast;         // JUST/PERFECT 는 앞 두 구간 가속
     }
+
+    if (bat.grade === 'STRIKE') this.strikes++;
+    else if (bat.grade === 'BALL') this.balls++;
+
+    if (bat.grade === 'STRIKE') bat.outcome = this.strikes >= COUNT.STRIKE_OUT ? 'STRIKEOUT' : 'CONTINUE';
+    else if (bat.grade === 'BALL') bat.outcome = this.balls >= COUNT.BALL_WALK ? 'WALK' : 'CONTINUE';
+    else bat.outcome = 'HIT';
+    bat.strikes = this.strikes;
+    bat.balls = this.balls;
 
     this.bat = bat;
-    this.emit('BAT_RESULT', { seq: this.seq, result: bat.grade, chance: bat.chance, zone: zone, mishit: bat.mishit });
-    this.pushEvent({ type: 'bat', grade: bat.grade, chance: bat.chance, mishit: bat.mishit,
-      lucky: bat.lucky, reason: bat.reason, zone: zone, end: end });
+    this.emit('BAT_RESULT', { seq: this.seq, pitchNo: this.pitchNo, result: bat.grade, reason: bat.reason,
+      outcome: bat.outcome, strikes: bat.strikes, balls: bat.balls, lives: bat.lives });
+    var ev = { type: 'bat' };
+    for (var k in bat) ev[k] = bat[k];
+    this.pushEvent(ev);
     this.setPhase('BAT_RESULT');
   };
 
@@ -141,76 +149,92 @@ var AttackSim = (function () {
         break;
 
       case 'BAT_RESULT':
-        if (this.bat.grade === 'MISS') this.pitch.t += dt;     // 헛친 공은 그대로 지나간다
-        if (this.t >= PHASE_TIME.BAT_RESULT) {
-          if (this.bat.grade === 'MISS') { this.out('MISS'); this.emitOut(); }
-          else this.enterChance();
-        }
-        break;
-
-      case 'CHANCE':
-        if (this.t >= PHASE_TIME.CHANCE) {
-          this.base = 0;
-          this.startLeg();
-          this.setPhase('RUNNING');
-        }
+        if (this.bat.outcome !== 'HIT') this.pitch.t += dt;     // 치지 못한 공은 그대로 지나간다
+        if (this.t >= PITCH.RESULT_TIME) this.afterBat();
         break;
 
       case 'RUNNING':
         this.updateRunning(dt);
         break;
 
-      case 'HR_RUN':
-        this.updateHomeRun();
-        break;
-
       case 'OUTRO':
         this.moveObstacles(dt);
-        if (this.t >= PHASE_TIME.OUTRO) this.emitOut();     // 실패 연출은 짧게 (§36)
+        if (this.t >= RUN.OUTRO) this.finish();              // 실패 연출은 짧게
         break;
     }
   };
 
-  P.enterChance = function () {
-    this.chance = this.bat.chance;
-    this.fever = 0;             // 피버는 타석마다 0 에서 시작한다
-    this.pushEvent({ type: 'chance', chance: this.chance });
-    this.setPhase('CHANCE');
+  P.afterBat = function () {
+    var bat = this.bat;
+    if (bat.outcome === 'CONTINUE') {
+      this.pitch = null;
+      this.setPhase('WAIT_PITCH');
+      if (this.queuedPitch) { var q = this.queuedPitch; this.queuedPitch = null; this.onPitch(q); }
+    } else if (bat.outcome === 'STRIKEOUT') {
+      this.result = { out: true, reason: 'STRIKEOUT', bases: 0 };
+      this.pushEvent({ type: 'out', reason: 'STRIKEOUT' });
+      this.finish();
+    } else if (bat.outcome === 'WALK') {
+      this.startRun(COUNT.WALK_BASE, COUNT.WALK_LIVES, 0, true);
+    } else {
+      this.startRun(0, bat.lives, bat.boostLegs, false);
+    }
   };
 
   /* ---------------- 주루 ----------------
      한 구간 = 베이스 하나. 구간 길이는 시간으로 고정되고, 달리는 중에도 장애물은 끊기지 않는다.
      베이스를 밟는 순간 아직 날아오는 장애물은 다음 구간으로 이어진다. */
 
+  P.startRun = function (base, lives, boostLegs, walk) {
+    this.base = base;
+    this.startBase = base;
+    this.lives = Math.min(RUN.LIFE_MAX, lives);
+    this.livesStart = this.lives;
+    this.boostLegs = boostLegs;
+    this.pitch = null;
+    this.startLeg();
+    this.pushEvent({ type: 'run', lives: this.lives, base: base, boostLegs: boostLegs, walk: walk });
+    this.setPhase('RUNNING');
+  };
+
+  P.makePlan = function (idx) {
+    return { index: idx, plan: buildLegPlan(idx, legDuration(idx, this.boostLegs), this.rng, !!this.debug.fan) };
+  };
+
   P.startLeg = function () {
     var idx = this.base;
-    var duration = legDuration(idx, this.fast);
-    this.leg = {
-      index: idx, duration: duration, time: 0, clock: 0,
-      plan: buildLegPlan(this.level, idx, duration, this.rng, !!this.debug.fan),
-      spawnIdx: 0, clear: 0, late: 0, fevered: this.invincible > 0
-    };
+    var next = this.nextPlan && this.nextPlan.index === idx ? this.nextPlan : this.makePlan(idx);
+    this.nextPlan = null;
+    this.leg = { index: idx, duration: legDuration(idx, this.boostLegs), time: 0, plan: next.plan, spawnIdx: 0,
+                 boosted: idx < this.boostLegs };
   };
 
   P.updateRunning = function (dt) {
-    var leg = this.leg;
-    /* 무적 돌진 중에는 베이스가 빨리 다가온다. 필드 장애물 일정은 실제 시간 기준이라 압축되지 않는다. */
-    leg.time += dt * (this.invincible > 0 ? RUN.FEVER_DASH : 1);
-    leg.clock += dt;
+    var leg = this.leg, i;
+    leg.time += dt;
     if (this.stiff > 0) this.stiff = Math.max(0, this.stiff - dt);
-    if (this.invincible > 0) this.invincible = Math.max(0, this.invincible - dt);
     if (this.dust > 0) this.dust = Math.max(0, this.dust - dt);
 
-    while (leg.spawnIdx < leg.plan.length && leg.plan[leg.spawnIdx].spawnAt <= leg.clock) {
+    while (leg.spawnIdx < leg.plan.length && leg.plan[leg.spawnIdx].spawnAt <= leg.time) {
       var s = leg.plan[leg.spawnIdx++];
       this.spawn(OBSTACLES[s.key].kind, OBSTACLES[s.key].spawn, s.speed, null, 0);
     }
-    for (var i = this.pending.length - 1; i >= 0; i--) {
+    for (i = this.pending.length - 1; i >= 0; i--) {
       var pd = this.pending[i];
       if (pd.at <= this.clock) {
         this.pending.splice(i, 1);
         this.spawn(pd.kind, pd.zone, pd.speed, pd.card, pd.switchAt);
       }
+    }
+    for (i = this.warnings.length - 1; i >= 0; i--) {
+      var w = this.warnings[i];
+      w.left -= dt;
+      if (w.left <= 0) { this.warnings.splice(i, 1); this.applyEffect(w); }
+    }
+
+    /* 수비자 선행 표시가 구간 경계를 넘을 수 있게 다음 구간 일정을 미리 만든다 */
+    if (!this.nextPlan && leg.index + 1 < HOME && leg.duration - leg.time <= RUN.PREVIEW_TIME) {
+      this.nextPlan = this.makePlan(leg.index + 1);
     }
 
     this.moveObstacles(dt);
@@ -225,11 +249,11 @@ var AttackSim = (function () {
       id: this.nextId++, kind: kind, zone: zone, fromZone: zone, def: def, required: def.requiredInput,
       distance: RUN.START_DISTANCE, speed: speed, window: def.reactionTime, resolved: null,
       card: card || null, switchAt: switchAt || 0, switched: false, switchDist: 0,
-      decel: null, decelDone: false
+      decel: null, decelDone: false, decelWarn: false
     });
   };
 
-  /* 거리값 하나로 접근시킨다 (§25). distance 0 = 플레이어 몸 중심 */
+  /* 거리값 하나로 접근시킨다. distance 0 = 플레이어 몸 중심 */
   P.moveObstacles = function (dt) {
     for (var i = this.obstacles.length - 1; i >= 0; i--) {
       var o = this.obstacles[i];
@@ -243,10 +267,8 @@ var AttackSim = (function () {
           o.speed *= o.decel.speedMul;
           o.decelDone = true;
         }
-        if (this.invincible > 0 && o.distance / o.speed <= o.window) {
-          this.resolve(o, 'FEVER');
-        } else if (o.distance <= 0) {
-          this.resolve(o, 'LATE');
+        if (o.distance <= 0) {
+          this.resolve(o, 'BAD', null);
           if (this.phase !== 'RUNNING') return;
         }
       }
@@ -266,13 +288,13 @@ var AttackSim = (function () {
 
   /* ---------------- 회피 판정 ----------------
      누르는 순간 판정한다. 충돌까지 유효 창 안으로 들어온 장애물 중
-       1) 누른 칸이 정답인 것이 있으면 가장 가까운 것 성공 (PERFECT_WINDOW 이내면 PERFECT)
-       2) 유효 창 안에 장애물은 있는데 정답이 아니면 가장 가까운 것에 WRONG
+       1) 누른 칸이 정답인 것이 있으면 가장 가까운 것 성공 (0.15 PERFECT / 0.30 GREAT / 그 전 GOOD)
+       2) 유효 창 안에 장애물은 있는데 정답이 아니면 가장 가까운 것에 BAD
        3) 유효 창 안에 아무것도 없으면 헛회피 — 짧은 경직
      칸마다 따로 판정하므로 두 칸을 같은 순간에 눌러 두 장애물을 함께 피할 수 있다. */
 
   P.dodge = function (zone) {
-    if (this.phase !== 'RUNNING' || this.invincible > 0 || this.stiff > 0) return;
+    if (this.phase !== 'RUNNING' || this.stiff > 0) return;
 
     var best = null, bestRemain = 1e9, near = null, nearRemain = 1e9;
     for (var i = 0; i < this.obstacles.length; i++) {
@@ -284,102 +306,64 @@ var AttackSim = (function () {
       if (o.required === zone && remain < bestRemain) { best = o; bestRemain = remain; }
     }
 
-    if (best) { this.resolve(best, bestRemain <= RUN.PERFECT_WINDOW ? 'PERFECT' : 'NICE', zone); return; }
-    if (near) { this.resolve(near, 'WRONG', zone); return; }
+    if (best) {
+      this.resolve(best, bestRemain <= RUN.PERFECT_WINDOW ? 'PERFECT' : (bestRemain <= RUN.GREAT_WINDOW ? 'GREAT' : 'GOOD'), zone);
+      return;
+    }
+    if (near) { this.resolve(near, 'BAD', zone); return; }
 
     this.stiff = RUN.WHIFF_STIFF;
     this.pushEvent({ type: 'whiff', zone: zone });
   };
 
   P.resolve = function (o, verdict, pressed) {
-    var leg = this.leg;
     o.resolved = verdict;
-
-    /* 피버 무적으로 지나간 장애물: 태그아웃 판정에서만 '피한 것' 이고 보상·감점은 없다 */
-    if (verdict === 'FEVER') { leg.clear++; return; }
-
     this.stats.total++;
     var ev = { type: 'verdict', verdict: verdict, kind: o.kind, zone: o.zone, required: o.required,
       pressed: pressed || null, card: o.card };
 
-    if (verdict === 'PERFECT' || verdict === 'NICE') {
-      var perfect = verdict === 'PERFECT';
-      var mult = 1 + Math.min(this.combo, RUN.COMBO_MAX) * RUN.COMBO_STEP;   // 연속 성공일수록 크게
-      var rw = o.def.reward;
+    if (verdict !== 'BAD') {
       this.stats.success++;
-      if (perfect) this.stats.perfect++;
-      leg.clear++;
-      this.combo++;
-      if (this.combo > this.stats.bestCombo) this.stats.bestCombo = this.combo;
-
-      this.gauge = Math.min(RUN.GAUGE_MAX,
-        this.gauge + (rw ? rw.gauge : Math.round((perfect ? RUN.GAUGE_PERFECT : RUN.GAUGE_NICE) * mult)));
-      this.fever = Math.min(RUN.FEVER_MAX,
-        this.fever + (rw ? rw.fever : Math.round((perfect ? RUN.FEVER_PERFECT : RUN.FEVER_NICE) * mult)));
-
-      ev.combo = this.combo;
+      if (verdict === 'PERFECT') this.stats.perfect++;
       this.pushEvent(ev);
       if (o.def.costGain) this.emit('DODGE_SUCCESS', { seq: this.seq, costGained: o.def.costGain });
       return;
     }
 
-    /* WRONG 은 잘못 누른 쪽으로 실제로 피한 뒤 맞는다 — 왜 맞았는지 보여야 한다 (§37).
-       아예 반응하지 못한 TOO LATE 가 더 무겁다. */
-    this.combo = 0;
-    if (verdict === 'WRONG') this.gauge += o.def.penalty;
-    else { this.gauge += o.def.penaltyLate; leg.late++; }
+    /* 틀린 칸은 잘못 누른 쪽으로 실제로 피한 뒤 맞는다 — 왜 맞았는지 보여야 한다 */
+    this.lives = Math.max(0, this.lives - o.def.lifeLoss);
+    ev.lives = this.lives;
     this.pushEvent(ev);
+    if (this.lives <= 0) this.endByLives();
+  };
 
-    if (this.gauge <= 0) { this.gauge = 0; this.out('GAUGE'); }
-    else if (leg.late >= RUN.LATE_OUT) this.out('NO_REACTION');
+  /* 생명 0: 마지막으로 밟은 베이스에서 세이프. 1루도 못 밟았으면 아웃 */
+  P.endByLives = function () {
+    this.pending = [];
+    this.warnings = [];
+    if (this.base >= 1) {
+      this.result = { out: false, reason: 'LIVES', bases: this.base };
+      this.pushEvent({ type: 'down', bases: this.base });
+    } else {
+      this.result = { out: true, reason: 'NO_FIRST', bases: 0 };
+      this.pushEvent({ type: 'out', reason: 'NO_FIRST' });
+    }
+    this.setPhase('OUTRO');
   };
 
   P.reachBase = function () {
-    /* 한 구간에서 단 하나도 피하지 못했다면 베이스 앞에서 잡힌다 (§19).
-       피버 무적을 쓴 구간은 예외 — 무적으로 건너뛴 구간을 벌하지 않는다. */
-    if (this.leg.clear === 0 && !this.leg.fevered) { this.out('NO_DODGE'); return; }
-
     this.base++;
     this.pushEvent({ type: 'base', base: this.base });
-    if (this.base >= this.chance) { this.safe(this.base); return; }
-    this.startLeg();
-  };
-
-  /* ---------------- 피버 ---------------- */
-
-  P.activateFever = function () {
-    if (this.phase !== 'RUNNING' || this.fever < RUN.FEVER_MAX || this.invincible > 0) return;
-    this.fever = 0;
-
-    /* 3B CHANCE 에서 발동하면 홈런 직행. 일반 주루로는 HR 이 나오지 않는다. */
-    if (this.chance >= MAX_BAT_CHANCE) {
-      this.emit('FEVER_ACTIVATE', { seq: this.seq, isHomeRun: true });
-      this.pushEvent({ type: 'homerun' });
+    if (this.base >= HOME) {
+      this.result = { out: false, reason: 'HOME', bases: HOME };
       this.obstacles = [];
       this.pending = [];
-      this.hrFrom = this.base;
-      this.setPhase('HR_RUN');
+      this.warnings = [];
+      this.pushEvent({ type: 'homerun' });
+      this.finish();
       return;
     }
-
-    this.invincible = RUN.FEVER_GUARD_TIME;
-    this.gauge = Math.min(RUN.GAUGE_MAX, this.gauge + RUN.FEVER_GUARD_GAUGE);
-    this.leg.fevered = true;
-    this.emit('FEVER_ACTIVATE', { seq: this.seq, isHomeRun: false });
-    this.pushEvent({ type: 'fever' });
-  };
-
-  P.updateHomeRun = function () {
-    var span = RUN.HR_RUN_TIME / (HOME_RUN - this.hrFrom);
-    var target = Math.min(HOME_RUN, this.hrFrom + Math.floor(this.t / span));
-    while (this.base < target) {
-      this.base++;
-      this.pushEvent({ type: 'base', base: this.base });
-    }
-    if (this.t >= RUN.HR_RUN_TIME) {
-      this.base = HOME_RUN;
-      this.safe(HOME_RUN);
-    }
+    this.startLeg();
   };
 
   /* ---------------- 수비 카드 ---------------- */
@@ -388,14 +372,14 @@ var AttackSim = (function () {
     var card = CARDS[p && p.cardId];
     if (!card || this.phase !== 'RUNNING') return;
 
-    if (card.effect) { this.applyEffect(card); return; }
+    if (card.effect) { this.warnEffect(card); return; }
 
-    var L = LEVELS[this.level], zones = p.zones || [], plans = [], lead = 0, i;
+    var speedMul = LEGS[this.leg.index].speedMul, zones = p.zones || [], plans = [], lead = 0, i;
     for (i = 0; i < card.spawns.length; i++) {
       var sp = card.spawns[i];
       var allowed = SLOT_ZONES[card.slots[sp.slot]];
       var zone = allowed.indexOf(zones[sp.slot]) >= 0 ? zones[sp.slot] : allowed[0];
-      var speed = OBSTACLES[obstacleKey(sp.kind, zone)].moveSpeed * L.speedMul * (sp.speedMul || 1) * windMul(this.rng);
+      var speed = OBSTACLES[obstacleKey(sp.kind, zone)].moveSpeed * speedMul * (sp.speedMul || 1) * windMul(this.rng);
       var travel = RUN.START_DISTANCE / speed;
       plans.push({ sp: sp, zone: zone, speed: speed, travel: travel });
       lead = Math.max(lead, travel - sp.delay);
@@ -412,26 +396,41 @@ var AttackSim = (function () {
     this.pushEvent({ type: 'card', cardId: card.id });
   };
 
-  P.applyEffect = function (card) {
-    var fx = card.effect;
-    if (fx.type === 'dust') {
-      this.dust = fx.time;
-    } else if (fx.type === 'decel') {
-      var target = findDecelTarget(this.obstacles, fx.at);
+  /* 교란 카드는 공격자 화면에 경고를 먼저 띄우고 WARN_TIME 뒤에 적용한다.
+     감속은 대상 공에 표시가 붙고, 흙먼지는 화면 가장자리에 먼지가 피어오른다. */
+  P.warnEffect = function (card) {
+    var fx = card.effect, target = null;
+    if (fx.type === 'decel') {
+      target = findDecelTarget(this.obstacles, fx.at + DEFENSE.WARN_TIME);
       if (!target) return;
-      target.decel = { at: fx.at, speedMul: fx.speedMul };
+      target.decelWarn = true;
     }
+    this.warnings.push({ card: card, left: DEFENSE.WARN_TIME, target: target });
+    this.pushEvent({ type: 'warn', effect: fx.type });
     this.pushEvent({ type: 'card', cardId: card.id });
   };
 
-  /* C07 대상: 아직 감속 지점에 닿지 않은, 가장 가까이 오는 공. 스냅숏 객체에도 그대로 쓴다. */
-  function findDecelTarget(list, at) {
+  P.applyEffect = function (w) {
+    var fx = w.card.effect;
+    if (fx.type === 'dust') { this.dust = fx.time; return; }
+    var target = w.target;
+    if (!target || target.resolved || target.distance / target.speed <= fx.at) {
+      if (target) target.decelWarn = false;
+      target = findDecelTarget(this.obstacles, fx.at);
+      if (!target) return;
+    }
+    target.decelWarn = false;
+    target.decel = { at: fx.at, speedMul: fx.speedMul };
+  };
+
+  /* C07 대상: 충돌까지 minRemain 보다 멀리 있는, 가장 가까이 오는 공. 스냅숏 객체에도 그대로 쓴다. */
+  function findDecelTarget(list, minRemain) {
     var best = null, bestRemain = 1e9;
     for (var i = 0; i < list.length; i++) {
       var o = list[i];
-      if (o.kind !== 'ball' || o.resolved || o.decel) continue;
+      if (o.kind !== 'ball' || o.resolved || o.decel || o.decelWarn) continue;
       var remain = o.distance / o.speed;
-      if (remain <= at) continue;
+      if (remain <= minRemain) continue;
       if (remain < bestRemain) { best = o; bestRemain = remain; }
     }
     return best;
@@ -439,47 +438,44 @@ var AttackSim = (function () {
 
   /* ---------------- 결과 ---------------- */
 
-  P.out = function (reason) {
-    this.result = { out: true, reason: reason, bases: 0 };
-    this.pending = [];
-    this.pushEvent({ type: 'out', reason: reason });
-    this.setPhase('OUTRO');
-  };
-
-  P.emitOut = function () {
-    this.emit('OUT_OCCURRED', this.summary({ currentOuts: this.outs + 1, reason: this.result.reason }));
+  P.finish = function () {
+    var r = this.result;
+    this.emit('AT_BAT_END', {
+      seq: this.seq, out: r.out, reason: r.reason, bases: r.bases, walk: this.startBase === COUNT.WALK_BASE,
+      batGrade: this.bat ? this.bat.grade : '', livesStart: this.livesStart, livesLeft: this.lives,
+      stats: { success: this.stats.success, total: this.stats.total, perfect: this.stats.perfect }
+    });
     this.setPhase('DONE');
   };
 
-  /* 최종 결과는 "갈 수 있었던 곳" 이 아니라 실제로 밟고 지나간 베이스 */
-  P.safe = function (bases) {
-    this.result = { out: false, reason: '', bases: bases };
-    this.obstacles = [];
-    this.pending = [];
-    this.pushEvent({ type: 'safe', bases: bases });
-    this.emit('SAFE', this.summary({ bases: bases, result: CHANCE_LABEL[bases] }));
-    this.setPhase('DONE');
-  };
-
-  P.summary = function (extra) {
-    var s = {
-      seq: this.seq,
-      batGrade: this.bat ? this.bat.grade : '',
-      mishit: this.bat ? this.bat.mishit : false,
-      startChance: this.bat ? this.bat.chance : 0,
-      stats: { success: this.stats.success, total: this.stats.total,
-               perfect: this.stats.perfect, bestCombo: this.stats.bestCombo }
-    };
-    for (var k in extra) s[k] = extra[k];
-    return s;
-  };
-
-  /* 마지막 베이스까지 남은 시간(표준 속도). 수비자가 카드를 쓸 수 있는지 판단한다. */
-  P.timeToFinal = function () {
+  /* 홈까지 남은 시간. 수비자가 장애물 카드를 쓸 수 있는지 판단한다. */
+  P.timeToHome = function () {
     if (this.phase !== 'RUNNING' || !this.leg) return 0;
     var t = this.leg.duration - this.leg.time;
-    for (var i = this.base + 1; i < this.chance; i++) t += legDuration(i, this.fast);
+    for (var i = this.leg.index + 1; i < HOME; i++) t += legDuration(i, this.boostLegs);
     return t;
+  };
+
+  /* 수비자 선행 표시: 앞으로 PREVIEW_TIME 안에 출발할 필드 장애물 */
+  P.preview = function () {
+    var out = [], leg = this.leg, i, e, inT;
+    if (this.phase !== 'RUNNING' || !leg) return out;
+    for (i = leg.spawnIdx; i < leg.plan.length; i++) {
+      e = leg.plan[i];
+      inT = e.spawnAt - leg.time;
+      if (inT > RUN.PREVIEW_TIME) break;
+      out.push({ key: e.key, kind: OBSTACLES[e.key].kind, zone: OBSTACLES[e.key].spawn, inT: inT });
+    }
+    if (this.nextPlan) {
+      var left = leg.duration - leg.time;
+      for (i = 0; i < this.nextPlan.plan.length; i++) {
+        e = this.nextPlan.plan[i];
+        inT = left + e.spawnAt;
+        if (inT > RUN.PREVIEW_TIME) break;
+        out.push({ key: e.key, kind: OBSTACLES[e.key].kind, zone: OBSTACLES[e.key].spawn, inT: inT });
+      }
+    }
+    return out;
   };
 
   P.snapshot = function () {
@@ -489,20 +485,22 @@ var AttackSim = (function () {
       obs.push({
         id: o.id, kind: o.kind, zone: o.zone, fromZone: o.fromZone, required: o.required,
         distance: o.distance, speed: o.speed, window: o.window, resolved: o.resolved, card: o.card,
-        switched: o.switched, switchDist: o.switchDist, decel: !!o.decel
+        switched: o.switched, switchDist: o.switchDist, decel: !!o.decel, decelWarn: o.decelWarn
       });
     }
+    var dustWarn = false;
+    for (var w = 0; w < this.warnings.length; w++) if (this.warnings[w].card.effect.type === 'dust') dustWarn = true;
     var pt = this.pitch;
     return {
-      seq: this.seq, atBat: this.atBat, level: this.level, outs: this.outs,
-      phase: this.phase, t: this.t,
-      pitch: pt ? { start: pt.start, end: pt.end, type: pt.type, dur: pt.dur, t: pt.t } : null,
-      bat: this.bat, chance: this.chance, fast: this.fast, base: this.base, hrFrom: this.hrFrom,
-      leg: this.leg ? { index: this.leg.index, time: this.leg.time, duration: this.leg.duration } : null,
-      toFinal: this.timeToFinal(),
-      gauge: this.gauge, fever: this.fever, combo: this.combo,
-      invincible: this.invincible, stiff: this.stiff, dust: this.dust,
-      obstacles: obs, events: this.events.slice(), result: this.result, stats: this.stats
+      seq: this.seq, phase: this.phase, t: this.t, pitchNo: this.pitchNo,
+      strikes: this.strikes, balls: this.balls,
+      pitch: pt ? { cardId: pt.cardId, start: pt.start, end: pt.end, startCell: pt.startCell, endCell: pt.endCell,
+                    ball: pt.ball, breaking: pt.breaking, dur: pt.dur, t: pt.t } : null,
+      bat: this.bat, lives: this.lives, livesStart: this.livesStart, base: this.base, startBase: this.startBase,
+      boostLegs: this.boostLegs,
+      leg: this.leg ? { index: this.leg.index, time: this.leg.time, duration: this.leg.duration, boosted: this.leg.boosted } : null,
+      toHome: this.timeToHome(), stiff: this.stiff, dust: this.dust, dustWarn: dustWarn,
+      obstacles: obs, preview: this.preview(), events: this.events.slice(), result: this.result, stats: this.stats
     };
   };
 
@@ -528,7 +526,7 @@ var AttackSide = (function () {
     var self = this;
     if (type === 'AT_BAT_START') {
       this.sim = new AttackSim({
-        seq: p.seq, atBat: p.atBat, level: p.level, outs: p.outs, debug: this.debug, rng: this.rng,
+        seq: p.seq, debug: this.debug, rng: this.rng,
         emit: function (t, payload) { self.endpoint.send(t, payload); }
       });
       this.sendTimer = 0;

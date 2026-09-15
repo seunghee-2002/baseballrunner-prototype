@@ -14,7 +14,6 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 const MatchCore = require('./js/match.js');
-const { MATCH } = require('./js/data.js');
 
 const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
@@ -204,7 +203,7 @@ function join(client) {
 
 function startMatch() {
   match = new MatchCore({
-    halves: MATCH.INNINGS * 2,
+    halves: 2,
     firstAttacker: 0,
     send: (i, type, payload) => { if (slots[i]) slots[i].send(type, payload); }
   });

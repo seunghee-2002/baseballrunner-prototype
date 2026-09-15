@@ -1,7 +1,9 @@
 /* =============================================================
    defense.js — 수비 쪽 규칙 (사람 수비·봇 수비 공용, DOM 없음)
-   2단계 터치 투구(3초 제한), 8장 덱 중 손패 4장.
-   코스트는 시간으로 차지 않고, 타자가 회피에 성공할 때마다만 찬다.
+   투구: 투구 카드(6장 풀, 손패 3 + 직구 고정)를 고르고(구질 3초, 넘기면 직구)
+         시작 칸을 탭한다(칸 3초, 넘기면 무작위 칸).
+   기습: 매치 전에 고른 장애물 덱 6장 중 손패 3장. 발동 후 전역 쿨다운.
+   코스트: 타석마다 고정 지급 + 타자의 회피 성공마다 +1. 투구 카드와 장애물 카드가 같이 쓴다.
    ============================================================= */
 
 var DefenseState = (function () {
@@ -15,28 +17,39 @@ var DefenseState = (function () {
     return list;
   }
 
-  function DefenseState(rng) {
+  /* 쓴 카드는 덱으로 돌아간다. 손패에 없는 카드 중 방금 쓴 것을 뺀 나머지에서 무작위로 뽑는다 */
+  function drawId(deck, hand, usedId, rng) {
+    var inHand = {}, pool = [], i;
+    for (i = 0; i < hand.length; i++) if (hand[i]) inHand[hand[i].id] = true;
+    for (i = 0; i < deck.length; i++) if (!inHand[deck[i]] && deck[i] !== usedId) pool.push(deck[i]);
+    return pool[Math.floor(rng() * pool.length)];
+  }
+
+  /* 새 DefenseState = 공수 교대 시점. 코스트 0, 손패 두 종류를 새로 섞는다 */
+  function DefenseState(rng, deck) {
     this.rng = rng || Math.random;
+    this.deck = validDeck(deck);
     this.uid = 0;
+    this.cost = 0;
+    this.cooldown = 0;
+
+    var ids = shuffle(this.deck.slice(), this.rng), i;
+    this.hand = [];
+    for (i = 0; i < DEFENSE.HAND_SIZE; i++) this.hand.push(this.makeCard(ids[i]));
+
+    var pids = shuffle(PITCH_DECK.slice(), this.rng);
+    this.pitchHand = [];
+    for (i = 0; i < DEFENSE.PITCH_HAND; i++) this.pitchHand.push({ uid: ++this.uid, id: pids[i] });
+
+    this.selecting = false;
+    this.pitchStage = null;    // 'PICK' 구질 선택 / 'ZONE' 칸 선택
     this.pitchLeft = 0;
-    this.pitchFirst = null;
-    this.pitchDone = true;
-    this.resetHalf();
+    this.pitchPick = null;     // -1 = 직구, 0~2 = 투구 손패
   }
 
   var P = DefenseState.prototype;
 
-  /* 공수 교대마다 코스트·손패를 새로 한다 */
-  P.resetHalf = function () {
-    this.cost = DEFENSE.COST_START;
-    this.lock = 0;
-    this.lockPending = false;
-    var ids = shuffle(DECK.slice(), this.rng);
-    this.hand = [];
-    for (var i = 0; i < DEFENSE.HAND_SIZE; i++) this.hand.push(this.makeCard(ids[i]));
-  };
-
-  /* 카드의 위치는 손패에 들어오는 순간 정해져 카드에 표시된다 */
+  /* 장애물 카드의 위치는 손패에 들어오는 순간 정해져 카드에 표시된다 */
   P.makeCard = function (id) {
     var def = CARDS[id], zones = [];
     for (var i = 0; i < def.slots.length; i++) {
@@ -46,25 +59,15 @@ var DefenseState = (function () {
     return { uid: ++this.uid, id: id, zones: zones };
   };
 
-  /* 쓴 카드는 덱으로 돌아간다. 손패에 없는 카드 중 방금 쓴 것을 뺀 나머지에서 무작위로 보충 */
-  P.draw = function (usedId) {
-    var inHand = {}, pool = [], i;
-    for (i = 0; i < this.hand.length; i++) if (this.hand[i]) inHand[this.hand[i].id] = true;
-    for (i = 0; i < DECK.length; i++) if (!inHand[DECK[i]] && DECK[i] !== usedId) pool.push(DECK[i]);
-    return this.makeCard(pool[Math.floor(this.rng() * pool.length)]);
-  };
+  P.grant = function (n) { this.cost = Math.min(DEFENSE.COST_MAX, this.cost + n); };
 
-  P.gainCost = function (n) { this.cost = Math.min(DEFENSE.COST_MAX, this.cost + n); };
-
-  /* LUCKY 핸디캡: 코스트 차감 + 주루가 시작되면 잠금 */
-  P.onLucky = function () {
-    this.cost = Math.max(0, this.cost - LUCKY.COST_PENALTY);
-    this.lockPending = true;
+  P.tick = function (dt) {
+    if (this.cooldown > 0) this.cooldown = Math.max(0, this.cooldown - dt);
   };
 
   /* 카드 장애물이 부딪히기까지 걸리는 가장 긴 시간 (바람으로 가장 느려진 경우) */
-  function cardArrival(def, level) {
-    var L = LEVELS[level] || LEVELS[1], lead = 0, last = 0;
+  function cardArrival(def, legIndex) {
+    var L = LEGS[legIndex] || LEGS[0], lead = 0, last = 0;
     for (var i = 0; i < def.spawns.length; i++) {
       var sp = def.spawns[i];
       var zone = SLOT_ZONES[def.slots[sp.slot]][0];
@@ -75,19 +78,20 @@ var DefenseState = (function () {
     return lead + last;
   }
 
-  /* 카드 i 를 지금 못 쓰는 이유. 쓸 수 있으면 '' — view 는 공격자 스냅숏 */
+  /* 장애물 카드 i 를 지금 못 쓰는 이유. 쓸 수 있으면 '' — view 는 공격자 스냅숏 */
   P.blockReason = function (i, view) {
     var c = this.hand[i];
     if (!c) return 'EMPTY';
     var def = CARDS[c.id];
-    if (!view || view.phase !== 'RUNNING') return 'PHASE';
-    if (this.lock > 0 || this.lockPending) return 'LOCK';
+    if (!view || view.phase !== 'RUNNING' || !view.leg) return 'PHASE';
+    if (this.cooldown > 0) return 'COOLDOWN';
     if (this.cost < def.cost) return 'COST';
-    if (def.effect && def.effect.type === 'decel' && !AttackSim.findDecelTarget(view.obstacles, def.effect.at)) {
+    if (def.effect && def.effect.type === 'decel' &&
+        !AttackSim.findDecelTarget(view.obstacles, def.effect.at + DEFENSE.WARN_TIME)) {
       return 'NO_TARGET';
     }
-    /* 마지막 베이스에 닿기 전에 부딪힐 수 없으면 버려지는 카드다 */
-    if (def.spawns && view.toFinal < cardArrival(def, view.level)) return 'TOO_LATE';
+    /* 홈에 닿기 전에 부딪힐 수 없으면 버려지는 카드다 */
+    if (def.spawns && view.toHome < cardArrival(def, view.leg.index)) return 'TOO_LATE';
     return '';
   };
 
@@ -95,35 +99,73 @@ var DefenseState = (function () {
     if (this.blockReason(i, view)) return null;
     var c = this.hand[i];
     this.cost -= CARDS[c.id].cost;
+    this.cooldown = DEFENSE.COOLDOWN;
     this.hand[i] = null;
-    this.hand[i] = this.draw(c.id);
+    this.hand[i] = this.makeCard(drawId(this.deck, this.hand, c.id, this.rng));
     return { cardId: c.id, zones: c.zones.slice(), spawnTime: Date.now() };
   };
 
-  /* ---------- 2단계 터치 투구 ---------- */
+  /* ---------- 투구 ---------- */
 
+  /* 투구 선택은 두 단계를 차례로 한다: 구질(PICK) → 칸(ZONE). 단계마다 제한 시간을 새로 센다 */
   P.beginPitch = function () {
-    this.pitchLeft = PITCH.SELECT_TIME;
-    this.pitchFirst = null;
-    this.pitchDone = false;
+    this.selecting = true;
+    this.pitchStage = 'PICK';
+    this.pitchLeft = PITCH.PICK_TIME;
+    this.pitchPick = null;
   };
 
-  /* 같은 칸 두 번 = 직구, 다른 칸 = 변화구 */
+  /* i: -1 = 직구, 0~2 = 투구 손패. 코스트가 모자라면 'COST' */
+  P.pitchBlock = function (i) {
+    if (i < 0) return '';
+    var c = this.pitchHand[i];
+    if (!c) return 'EMPTY';
+    return this.cost < PITCH_CARDS[c.id].cost ? 'COST' : '';
+  };
+
+  /* 구질을 고르면 바로 칸 단계로 넘어간다. 칸 단계에서는 구질을 바꿀 수 없다 */
+  P.pickPitch = function (i) {
+    if (!this.selecting || this.pitchStage !== 'PICK' || this.pitchBlock(i)) return;
+    this.pitchPick = i;
+    this.pitchStage = 'ZONE';
+    this.pitchLeft = PITCH.ZONE_TIME;
+  };
+
+  /* 칸 단계에서 칸을 탭한다. zone 은 수비자(투수 시점) 화면 기준 칸 — 타자 시점으로는 좌우가 반대 */
   P.tapPitch = function (zone) {
-    if (this.pitchDone) return null;
-    if (!this.pitchFirst) { this.pitchFirst = zone; return null; }
-    this.pitchDone = true;
-    return { startPos: ZONE_NUM[this.pitchFirst], endPos: ZONE_NUM[zone] };
+    if (!this.selecting || this.pitchStage !== 'ZONE') return null;
+    return this.throwAt(zone, false);
   };
 
-  /* 3초 안에 두 칸을 다 고르지 못하면 무작위 칸 직구 */
+  P.throwAt = function (zone, timeout) {
+    var i = this.pitchPick, cardId = null;
+    if (i >= 0) {
+      var c = this.pitchHand[i];
+      cardId = c.id;
+      this.cost -= PITCH_CARDS[cardId].cost;
+      this.pitchHand[i] = null;
+      this.pitchHand[i] = { uid: ++this.uid, id: drawId(PITCH_DECK, this.pitchHand, cardId, this.rng) };
+    }
+    this.selecting = false;
+    this.pitchStage = null;
+    this.pitchPick = null;
+    return { cardId: cardId, start: MIRROR_ZONE[zone], speedMul: this.speedMul(), timeout: timeout };
+  };
+
+  P.speedMul = function () { return 1 + (this.rng() * 2 - 1) * PITCH.SPEED_RANDOM; };
+
+  /* 구질 시간 초과 = 직구로 정하고 칸 단계로. 칸 시간 초과 = 고른 구질로 무작위 칸 */
   P.tickPitch = function (dt) {
-    if (this.pitchDone) return null;
+    if (!this.selecting) return null;
     this.pitchLeft -= dt;
     if (this.pitchLeft > 0) return null;
-    this.pitchDone = true;
-    var z = ZONES[Math.floor(this.rng() * ZONES.length)];
-    return { startPos: ZONE_NUM[z], endPos: ZONE_NUM[z], timeout: true };
+    if (this.pitchStage === 'PICK') {
+      this.pitchPick = -1;
+      this.pitchStage = 'ZONE';
+      this.pitchLeft = PITCH.ZONE_TIME;
+      return null;
+    }
+    return this.throwAt(ZONES[Math.floor(this.rng() * ZONES.length)], true);
   };
 
   DefenseState.cardArrival = cardArrival;
@@ -141,14 +183,15 @@ var DefenseSide = (function () {
     return c;
   }
 
+  /* opts: { rng, deck } */
   function DefenseSide(endpoint, opts) {
     this.endpoint = endpoint;
-    this.state = new DefenseState(opts && opts.rng);
+    this.state = new DefenseState(opts && opts.rng, opts && opts.deck);
     this.seq = 0;
-    this.level = 1;
+    this.pitchNo = 0;
+    this.reselectIn = 0;
     this.view = null;       // 마지막으로 받은 공격자 스냅숏
     this.viewAge = 0;
-    this.selecting = false;
   }
 
   var P = DefenseSide.prototype;
@@ -157,33 +200,35 @@ var DefenseSide = (function () {
     var st = this.state;
     if (type === 'AT_BAT_START') {
       this.seq = p.seq;
-      this.level = p.level;
+      this.pitchNo = 0;
+      this.reselectIn = 0;
       this.view = null;
-      st.lock = 0;
-      st.lockPending = false;
+      st.grant(p.costGrant || 0);
       st.beginPitch();
-      this.selecting = true;
     } else if (p && p.seq !== this.seq) {
       return;
     } else if (type === 'RUN_STATE') {
       this.view = p;
       this.viewAge = 0;
     } else if (type === 'BAT_RESULT') {
-      if (p.result === 'LUCKY') st.onLucky();
+      /* 스트라이크·볼이면 결과를 보여준 뒤 같은 타석에서 다시 던진다 */
+      if (p.outcome === 'CONTINUE' && p.pitchNo === this.pitchNo) this.reselectIn = PITCH.RESULT_TIME;
     } else if (type === 'DODGE_SUCCESS') {
-      st.gainCost(p.costGained || 0);
+      st.grant(p.costGained || 0);
     }
   };
 
+  P.pickPitch = function (i) { this.state.pickPitch(i); };
+
   P.tapZone = function (zone) {
-    if (!this.selecting) return;
     var pitch = this.state.tapPitch(zone);
     if (pitch) this.throwPitch(pitch);
   };
 
   P.throwPitch = function (pitch) {
-    this.selecting = false;
+    this.pitchNo++;
     pitch.seq = this.seq;
+    pitch.pitchNo = this.pitchNo;
     this.endpoint.send('PITCH_SELECT', pitch);
   };
 
@@ -198,15 +243,13 @@ var DefenseSide = (function () {
   P.update = function (dt) {
     var st = this.state;
     this.viewAge += dt;
-    if (this.selecting) {
-      var pitch = st.tickPitch(dt);
-      if (pitch) this.throwPitch(pitch);
+    st.tick(dt);
+    if (this.reselectIn > 0) {
+      this.reselectIn -= dt;
+      if (this.reselectIn <= 0) { this.reselectIn = 0; st.beginPitch(); }
     }
-    if (st.lockPending && this.view && this.view.phase === 'RUNNING') {
-      st.lock = LUCKY.CARD_LOCK;
-      st.lockPending = false;
-    }
-    if (st.lock > 0) st.lock = Math.max(0, st.lock - dt);
+    var pitch = st.tickPitch(dt);
+    if (pitch) this.throwPitch(pitch);
   };
 
   /* 받은 스냅숏을 받은 뒤 흐른 시간만큼 앞으로 밀어 쓴다 (20Hz 사이 보간 + LAN 지연) */
@@ -225,13 +268,19 @@ var DefenseSide = (function () {
     out.t = v.t + a;
     if (v.pitch) {
       out.pitch = clone(v.pitch);
-      var flying = v.phase === 'PITCH' || (v.phase === 'BAT_RESULT' && v.bat && v.bat.grade === 'MISS');
+      var flying = v.phase === 'PITCH' || (v.phase === 'BAT_RESULT' && v.bat && v.bat.outcome !== 'HIT');
       if (flying) out.pitch.t += a;
     }
     if (v.leg && v.phase === 'RUNNING') {
       out.leg = clone(v.leg);
-      out.leg.time += a * (v.invincible > 0 ? RUN.FEVER_DASH : 1);
-      out.toFinal = Math.max(0, v.toFinal - a);
+      out.leg.time = Math.min(v.leg.duration, v.leg.time + a);
+      out.toHome = Math.max(0, v.toHome - a);
+      out.preview = [];
+      for (i = 0; i < v.preview.length; i++) {
+        var pv = clone(v.preview[i]);
+        pv.inT -= a;
+        if (pv.inT > 0) out.preview.push(pv);
+      }
     }
     return out;
   };

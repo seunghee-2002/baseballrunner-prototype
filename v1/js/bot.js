@@ -1,45 +1,40 @@
 /* =============================================================
-   bot.js — 연습 모드용 봇 (정교한 AI 가 아니다, 확률로만 움직인다)
-   BotDefender : 무작위 투구 카드 + 무작위 칸, 코스트가 되면 확률적으로 장애물 카드를 쓴다
+   bot.js — 1인 연습 모드용 봇 (정교한 AI 가 아니다, 확률로만 움직인다)
+   BotDefender : 무작위 2단계 투구, 코스트가 되면 확률적으로 카드를 쓴다
    BotBatter   : 확률로 타격·회피하고, 가끔 C03/C04 전환과 C07 감속에 속는다
    ============================================================= */
 
 var BotDefender = (function () {
 
+  var FASTBALL_RATE = 0.4;
   var THINK_EVERY = 0.5;
   var CARD_RATE = 0.35;       // 한 번 생각할 때 카드를 쓸 확률
 
   function BotDefender(side, rng) {
     this.side = side;
     this.rng = rng || Math.random;
-    this.pitchIn = 0;
-    this.wasStage = null;
+    this.pitchIn = -1;
     this.think = 0;
   }
 
   var P = BotDefender.prototype;
 
-  P.handle = function () {};
+  P.handle = function (type) {
+    if (type === 'AT_BAT_START') this.pitchIn = 0.8 + this.rng() * 1.4;
+  };
 
   P.update = function (dt) {
-    var side = this.side, st = side.state, rng = this.rng, i;
+    var side = this.side, rng = this.rng;
 
-    /* 구질 단계가 열리면 0.8~2.2초 뒤 쓸 수 있는 투구(직구 포함) 중 하나, 칸 단계가 열리면 0.2~0.6초 뒤 무작위 칸.
-       볼이 되는 조합도 그대로 낸다 */
-    var stage = st.selecting ? st.pitchStage : null;
-    if (stage !== this.wasStage) {
-      if (stage === 'PICK') this.pitchIn = 0.8 + rng() * 1.4;
-      else if (stage === 'ZONE') this.pitchIn = 0.2 + rng() * 0.4;
-    }
-    this.wasStage = stage;
-    if (stage) {
+    if (side.selecting && this.pitchIn > 0) {
       this.pitchIn -= dt;
-      if (this.pitchIn <= 0 && stage === 'PICK') {
-        var options = [-1];
-        for (i = 0; i < st.pitchHand.length; i++) if (!st.pitchBlock(i)) options.push(i);
-        side.pickPitch(options[Math.floor(rng() * options.length)]);
-      } else if (this.pitchIn <= 0) {
-        side.tapZone(ZONES[Math.floor(rng() * 4)]);
+      if (this.pitchIn <= 0) {
+        var start = ZONES[Math.floor(rng() * 4)], end = start;
+        if (rng() >= FASTBALL_RATE) {
+          while (end === start) end = ZONES[Math.floor(rng() * 4)];
+        }
+        side.tapZone(start);
+        side.tapZone(end);
       }
     }
 
@@ -50,8 +45,8 @@ var BotDefender = (function () {
     var view = side.liveView();
     if (!view || view.phase !== 'RUNNING' || rng() > CARD_RATE) return;
     var usable = [];
-    for (i = 0; i < st.hand.length; i++) {
-      if (!st.blockReason(i, view)) usable.push(i);
+    for (var i = 0; i < side.state.hand.length; i++) {
+      if (!side.state.blockReason(i, view)) usable.push(i);
     }
     if (usable.length) side.playCard(usable[Math.floor(rng() * usable.length)]);
   };
@@ -64,7 +59,6 @@ var BotBatter = (function () {
   var SKILL = {
     course: 0.70,       // 도착 칸을 정확히 친다
     adjacent: 0.20,     // 옆 칸 (나머지는 대각선)
-    ballSwing: 0.30,    // 볼에 스윙한다
     timingSd: 0.09,     // 타이밍 오차 표준편차(초)
     noSwing: 0.05,
     dodgeRight: 0.85,   // 정답 칸으로 회피
@@ -89,7 +83,6 @@ var BotBatter = (function () {
     this.side = side;
     this.rng = rng || Math.random;
     this.seq = -1;
-    this.pitchNo = -1;
     this.plans = {};
     this.swingAt = -1;
     this.swingZone = null;
@@ -105,7 +98,7 @@ var BotBatter = (function () {
     if (sim.seq !== this.seq) {
       this.seq = sim.seq;
       this.plans = {};
-      this.pitchNo = -1;
+      this.swingAt = -1;
     }
 
     if (sim.phase === 'PITCH') this.bat(sim);
@@ -133,36 +126,31 @@ var BotBatter = (function () {
         sim.dodge(plan.zone);
       }
     }
+
+    if (sim.fever >= RUN.FEVER_MAX && (sim.chance >= MAX_BAT_CHANCE || sim.gauge < 40)) sim.activateFever();
   };
 
-  /* at: 충돌까지 남은 시간이 이만큼일 때 누른다 (유효 창 0.45 안) */
   P.makePlan = function (required, key) {
     var r = this.rng();
-    var plan = { key: key, zone: null, at: 0.05 + this.rng() * 0.38 };
+    var plan = { key: key, zone: null, at: 0.05 + this.rng() * 0.33 };
     if (r < SKILL.dodgeRight) plan.zone = required;
     else if (r < SKILL.dodgeRight + SKILL.dodgeWrong) plan.zone = otherZone(required, this.rng);
     return plan;
   };
 
   P.bat = function (sim) {
-    var rng = this.rng, pt = sim.pitch;
-    if (this.pitchNo !== sim.pitchNo) {
-      this.pitchNo = sim.pitchNo;
-      var swing = pt.ball ? rng() < SKILL.ballSwing : rng() >= SKILL.noSwing;
-      if (pt.ball) {
-        this.swingZone = ZONES[Math.floor(rng() * 4)];
-      } else {
-        var end = pt.end, r = rng();
-        if (r < SKILL.course) this.swingZone = end;
-        else if (r < SKILL.course + SKILL.adjacent) {
-          var z = end;
-          while (z === end || z === OPPOSITE_ZONE[end]) z = ZONES[Math.floor(rng() * 4)];
-          this.swingZone = z;
-        } else this.swingZone = OPPOSITE_ZONE[end];
-      }
-      this.swingAt = swing ? Math.max(0.01, pt.dur + gaussian(rng) * SKILL.timingSd) : 1e9;
+    var rng = this.rng;
+    if (this.swingAt < 0) {
+      var end = sim.pitch.end, r = rng();
+      if (r < SKILL.course) this.swingZone = end;
+      else if (r < SKILL.course + SKILL.adjacent) {
+        var z = end;
+        while (z === end || z === OPPOSITE_ZONE[end]) z = ZONES[Math.floor(rng() * 4)];
+        this.swingZone = z;
+      } else this.swingZone = OPPOSITE_ZONE[end];
+      this.swingAt = rng() < SKILL.noSwing ? 1e9 : Math.max(0.01, sim.pitch.dur + gaussian(rng) * SKILL.timingSd);
     }
-    if (pt.t >= this.swingAt) sim.swing(this.swingZone);
+    if (sim.pitch.t >= this.swingAt) sim.swing(this.swingZone);
   };
 
   return BotBatter;

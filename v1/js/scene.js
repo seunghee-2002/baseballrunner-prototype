@@ -1,12 +1,8 @@
 /* =============================================================
    scene.js — three.js 렌더링 계층
-   프리미티브 도형만 쓴다. 회피는 기울임·다리 들기 트윈으로만 표현한다.
-   장애물은 스냅숏의 distance 값 하나를 좌표로 환산한다.
-   공격자와 수비자는 같은 스냅숏을 서로 다른 카메라(뷰)로 그린다 (v2 10.2).
-     bat   : 공격자 타격 — 타자 뒤, 스트라이크존 높이. 위·아래 칸이 갈리게 한다
-     pitch : 수비자 투구 — 투수 뒤 시점 (좌우가 타자 시점과 반대)
-     run   : 공격자 주루 — 주자 뒤 3인칭
-     field : 수비자 주루 — 필드 전경. 필드 장애물 예고를 먼저 본다
+   프리미티브 도형만 쓴다. 캐릭터 3D 애니메이션은 만들지 않는다 (§26).
+   장애물은 스냅숏의 distance 값 하나를 좌표로 환산한다 (§25).
+   공격자·수비자 화면이 같은 함수로 같은 장면을 그린다.
    ============================================================= */
 
 var Scene3D = (function () {
@@ -16,37 +12,28 @@ var Scene3D = (function () {
   var laneMarks = [], pitcher, pitchBall, mound, strikeZone, baseMarker;
   var boost = 0;            // 베이스를 밟고 지나갈 때의 짧은 속도감
 
-  /* 스트라이크존 칸 중심. c·r 이 0~1 을 벗어나면 존 밖(볼) 위치 */
-  var ZONE_X0 = -0.19, ZONE_DX = 0.38, ZONE_Y0 = 1.43, ZONE_DY = 0.36;
-  var ZONE_Z = 0.55;
-  var BATTER_X = -1.0;
-
-  function cellPoint(cell) {
-    return { x: ZONE_X0 + cell.c * ZONE_DX, y: ZONE_Y0 - cell.r * ZONE_DY };
-  }
-
-  /* 뷰별 카메라. 수치는 플레이하며 맞춘다 */
-  var VIEWS = {
-    bat:   { pos: [0, 1.5, 4.2],   look: [0, 1.3, -12],  fov: 50, fogFar: 78 },
-    pitch: { pos: [0, 1.95, -24],  look: [0, 1.25, ZONE_Z], fov: 16, fogFar: 78 },
-    run:   { pos: [0, 2.55, 4.7],  look: [0, 1.30, -8],  fov: 58, fogFar: 78 },
-    field: { pos: [0, 10, 10],     look: [0, 0, -10],    fov: 55, fogFar: 140 }
+  /* 스트라이크존 4칸의 중심 — 화면 4분할과 같은 배치 (§8) */
+  var ZONE_POINT = {
+    LT: { x: -0.19, y: 1.43 },
+    RT: { x:  0.19, y: 1.43 },
+    LB: { x: -0.19, y: 1.07 },
+    RB: { x:  0.19, y: 1.07 }
   };
+  var ZONE_Z = 0.55;
 
-  var view = '';
+  var mode = 'bat';
   var runSpeed = 0;
   var runPhase = 0;
   var shakeAmt = 0;
   var flyBall = null;
   var baseX = 0;
-  var fovTarget = 58;
 
   var pose = { leanZ: 0, offX: 0, legL: 0, legR: 0, crouch: 0 };
   var cur  = { leanZ: 0, offX: 0, legL: 0, legR: 0, crouch: 0 };
   var poseTimer = 0;
 
-  var camPos = new THREE.Vector3(0, 1.55, 3.6);
-  var camLook = new THREE.Vector3(0, 1.28, -12);
+  var camPos = new THREE.Vector3(0, 2.9, 6.4);
+  var camLook = new THREE.Vector3(0, 1.5, -14);
   var camPosTarget = camPos.clone();
   var camLookTarget = camLook.clone();
 
@@ -61,11 +48,9 @@ var Scene3D = (function () {
   var Z_PER_DIST = 0.42;    // distance 100 -> z 약 -42
   var SWITCH_TIME = 0.18;   // C03·C04 가 옆 칸으로 옮겨가는 데 걸리는 시간 — 순간이동하면 눈으로 못 따라간다
 
-  /* 카드 장애물은 필드 장애물과 색이 다르다 (공격자·수비자 모두) */
   var GLOW = { ball: 0xffe14d, fielder: 0xff5a4d, fan: 0x7ef2c0, card: 0xff7a1a };
 
   var obMeshes = {};        // 스냅숏 장애물 id -> mesh
-  var ghosts = [];          // 수비자 선행 예고 메시 풀
 
   /* ---------------------------------------------------------- */
 
@@ -146,8 +131,8 @@ var Scene3D = (function () {
     sh.position.y = 0.03;
     player.add(sh);
 
-    /* 보너스 속도 잔상 */
-    aura = glowSphere(1.05, 0x35c2ff, 0.0);
+    /* 피버 무적 표시 */
+    aura = glowSphere(1.05, 0xff5ad0, 0.0);
     aura.position.y = 1.0;
     aura.scale.y = 1.25;
     aura.visible = false;
@@ -169,7 +154,7 @@ var Scene3D = (function () {
     ground.position.set(0, 0.01, -140);
     scene.add(ground);
 
-    /* 속도감을 만드는 라인 마커 */
+    /* 속도감을 만드는 라인 마커 (§24) */
     for (var i = 0; i < 30; i++) {
       var m = new THREE.Mesh(new THREE.PlaneGeometry(0.28, 1.6),
         new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 }));
@@ -201,21 +186,12 @@ var Scene3D = (function () {
     pitchBall.visible = false;
     scene.add(pitchBall);
 
-    /* 스트라이크존 4분할. 위 칸과 아래 칸을 색으로 갈라 공이 어느 줄로 오는지 읽히게 한다. 타이밍 링은 없다. */
+    /* 스트라이크존 4분할 격자 — 타이밍 링은 없다. 공의 궤적만 보고 친다. */
     strikeZone = new THREE.Group();
-    var W = 0.76, H = 0.72, T = 0.016, g;
-    var cellMat = [
-      new THREE.MeshBasicMaterial({ color: 0x35c2ff, transparent: true, opacity: 0.10, side: THREE.DoubleSide }),
-      new THREE.MeshBasicMaterial({ color: 0xffb43c, transparent: true, opacity: 0.08, side: THREE.DoubleSide })
-    ];
-    for (var r = 0; r < 2; r++) {
-      var cell = new THREE.Mesh(new THREE.PlaneGeometry(W, H / 2), cellMat[r]);
-      cell.position.set(0, 1.25 + (r === 0 ? H / 4 : -H / 4), -0.01);
-      strikeZone.add(cell);
-    }
-    var lineMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55 });
+    var lineMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.30 });
+    var W = 0.76, H = 0.72, T = 0.014, g;
     for (g = -1; g <= 1; g++) {
-      var hbar = new THREE.Mesh(new THREE.BoxGeometry(W, g === 0 ? T * 2 : T, T), lineMat);
+      var hbar = new THREE.Mesh(new THREE.BoxGeometry(W, T, T), lineMat);
       hbar.position.set(0, 1.25 + g * (H / 2), 0);
       strikeZone.add(hbar);
       var vbar = new THREE.Mesh(new THREE.BoxGeometry(T, H, T), lineMat);
@@ -258,7 +234,6 @@ var Scene3D = (function () {
     buildLights();
     buildField();
     buildPlayer();
-    setView('bat');
     resize();
   }
 
@@ -276,35 +251,27 @@ var Scene3D = (function () {
 
   /* ---------------------------------------------------------- */
 
-  function setView(v) {
-    if (view === v) return;
-    /* 투수 시점은 반대 방향을 본다 — 보간하면 카메라가 보는 점을 지나가며 뒤집히므로 바로 옮긴다 */
-    var snap = !view || v === 'pitch' || view === 'pitch';
-    view = v;
-    var c = VIEWS[v];
-    camPosTarget.set(c.pos[0], c.pos[1], c.pos[2]);
-    camLookTarget.set(c.look[0], c.look[1], c.look[2]);
-    fovTarget = c.fov;
-    if (snap) {
-      camPos.copy(camPosTarget);
-      camLook.copy(camLookTarget);
-      camera.fov = c.fov;
-      camera.updateProjectionMatrix();
+  function setMode(m) {
+    if (mode === m) return;
+    mode = m;
+    var bat = m === 'bat';
+    if (bat) {
+      camPosTarget.set(0, 2.9, 6.4);
+      camLookTarget.set(0, 1.5, -14);
+      player.rotation.y = 0;
+    } else {
+      camPosTarget.set(0, 2.55, 4.7);
+      camLookTarget.set(0, 1.30, -8);
+      pitchBall.visible = false;
     }
-    scene.fog.far = c.fogFar;
-
-    var batting = v === 'bat' || v === 'pitch';
-    player.rotation.y = 0;
-    batPivot.visible = batting;
-    pitcher.visible = v === 'bat';      // 투수 시점에서는 투수 몸이 화면을 가린다
-    mound.visible = batting;
-    strikeZone.visible = batting;
-    if (batting) baseMarker.visible = false;
-    else pitchBall.visible = false;
-    if (v !== 'field') hideGhosts();
+    batPivot.visible = bat;
+    pitcher.visible = bat;
+    mound.visible = bat;
+    strikeZone.visible = bat;
+    if (bat) baseMarker.visible = false;
   }
 
-  /* mul: 0 = 멈춤, 1 = 주루, 그 이상 = 보너스 속도 */
+  /* mul: 0 = 멈춤, 1 = 주루, 그 이상 = 피버 돌진 */
   function setRunning(mul) { runSpeed = 15 * (mul || 0); }
 
   /* ---------- 회피 포즈 ----------
@@ -328,15 +295,6 @@ var Scene3D = (function () {
     shake(0.42);
   }
 
-  /* 생명 0 — 넘어진다 */
-  function fall() {
-    pose.crouch = 0.75;
-    pose.leanZ = 0.5;
-    pose.offX = 0;
-    poseTimer = 1.4;
-    shake(0.5);
-  }
-
   function shake(a) { shakeAmt = Math.max(shakeAmt, a); }
 
   function setAura(on) { aura.visible = !!on; }
@@ -346,15 +304,12 @@ var Scene3D = (function () {
   var swingT = -1;
   function swing() { swingT = 0; }
 
-  /* pitch: { startCell, endCell, breaking, dur, t } — 변화구는 비행 BREAK_AT 지점부터 도착 칸으로 휜다.
-     볼은 존 밖 칸 위치로 빠진다. */
+  /* pitch: { start, end, type, dur, t } — 변화구는 비행 BREAK_AT 지점부터 도착 칸으로 휜다 */
   function setPitch(pitch) {
-    var p = pitch.t / pitch.dur;
-    /* 존을 지난 공은 카메라 쪽으로 계속 오면 화면을 덮는다 — 조금만 지나가게 두고 감춘다 */
-    if (p > 1.06) { if (!flyBall) pitchBall.visible = false; return; }
-    var s = cellPoint(pitch.startCell), e = cellPoint(pitch.endCell);
+    var p = Math.min(1.12, pitch.t / pitch.dur);
+    var s = ZONE_POINT[pitch.start], e = ZONE_POINT[pitch.end];
     var bend = 0;
-    if (pitch.breaking && p > PITCH.BREAK_AT) {
+    if (pitch.type === 'BREAK' && p > PITCH.BREAK_AT) {
       var k = Math.min(1, (p - PITCH.BREAK_AT) / (1 - PITCH.BREAK_AT));
       bend = k * k * (3 - 2 * k);
     }
@@ -378,17 +333,17 @@ var Scene3D = (function () {
     pitchBall.visible = true;
   }
 
-  /* ---------- 장애물 ---------- */
+  /* ---------- 장애물 (§25) ---------- */
 
   function makeObstacle(o) {
     var g = new THREE.Group(), glow;
     var color = o.card ? GLOW.card : GLOW[o.kind];
 
     if (o.kind === 'ball') {
-      g.add(ball(0.17, o.card ? 0xff9a3d : 0xfdfdfd, 14));
+      g.add(ball(0.17, 0xfdfdfd, 14));
       glow = glowSphere(0.30, color, 0.18);
     } else if (o.kind === 'fielder') {
-      var body = makeHuman(o.card ? 0xc4461a : 0x2a3a8c, 0xe8b48c, 0x101a3a);
+      var body = makeHuman(o.card ? 0x8c2a2a : 0x2a3a8c, 0xe8b48c, 0x101a3a);
       var lgl = makeLeg(-0.15, 0x1a234a); lgl.rotation.x = 0.7;
       var lgr = makeLeg(0.15, 0x1a234a); lgr.rotation.x = -0.5;
       body.add(lgl); body.add(lgr);
@@ -408,15 +363,7 @@ var Scene3D = (function () {
       glow = glowSphere(0.6, color, 0.14);
     }
     g.add(glow);
-
-    /* C07 경고: 감속될 공 주변 표시 */
-    var ring = new THREE.Mesh(new THREE.TorusGeometry(0.42, 0.05, 6, 20),
-      new THREE.MeshBasicMaterial({ color: 0xb46bff, transparent: true, opacity: 0.9 }));
-    ring.visible = false;
-    g.add(ring);
-
     g.userData.glow = glow;
-    g.userData.ring = ring;
     g.userData.kind = o.kind;
     return g;
   }
@@ -439,8 +386,6 @@ var Scene3D = (function () {
     mesh.position.set(p.x, p.y, -o.distance * Z_PER_DIST);
   }
 
-  var ringPulse = 0;
-
   /* 스냅숏 장애물 목록과 장면을 맞춘다. 새 id 는 만들고, 사라진 id 는 지운다. */
   function syncObstacles(list) {
     var seen = {}, id;
@@ -450,22 +395,14 @@ var Scene3D = (function () {
       if (!m) { m = obMeshes[o.id] = makeObstacle(o); scene.add(m); }
       seen[o.id] = true;
       place(m, o);
-      if (m.userData.kind === 'ball') { m.children[0].rotation.x += 0.25; m.children[0].rotation.y += 0.18; }
+      if (m.userData.kind === 'ball') { m.rotation.x += 0.25; m.rotation.y += 0.18; }
 
-      /* 유효 창에 들어오면 빛난다 — 지금 누르면 받아진다는 신호 */
+      /* 유효 창에 들어오면 빛난다 — 지금 누르면 받아진다는 신호 (§37) */
       var armed = !o.resolved && o.distance > 0 && o.distance / o.speed <= o.window;
       var gl = m.userData.glow;
       gl.material.opacity = o.resolved ? 0 : (armed ? (m.userData.kind === 'ball' ? 0.6 : 0.4) : 0.15);
       var s = armed ? 1.45 : 1;
       gl.scale.set(s, s, s);
-
-      var ring = m.userData.ring;
-      ring.visible = !!(o.decelWarn && !o.resolved);
-      if (ring.visible) {
-        var rs = 1 + Math.abs(Math.sin(ringPulse * 9)) * 0.35;
-        ring.scale.set(rs, rs, rs);
-        ring.lookAt(camera.position);
-      }
     }
     for (id in obMeshes) {
       if (!seen[id]) {
@@ -478,39 +415,11 @@ var Scene3D = (function () {
 
   function clearObstacles() { syncObstacles([]); }
 
-  /* ---------- 수비자 선행 예고 ----------
-     list: [{ kind, zone, inT }] — 출발까지 남은 시간이 줄수록 진해진다 */
-  var GHOST_COLOR = { ball: 0xffe14d, fielder: 0xff5a4d, fan: 0x7ef2c0 };
-
-  function syncPreview(list) {
-    var i;
-    for (i = 0; i < list.length; i++) {
-      var g = ghosts[i];
-      if (!g) {
-        g = ghosts[i] = glowSphere(0.9, 0xffffff, 0.3);
-        scene.add(g);
-      }
-      var e = list[i];
-      var p = pathPoint(e.zone, 0);
-      g.material.color.setHex(GHOST_COLOR[e.kind] || 0xffffff);
-      var k = 1 - Math.max(0, Math.min(1, e.inT / RUN.PREVIEW_TIME));
-      g.material.opacity = 0.12 + 0.5 * k;
-      var sc = 0.6 + 0.6 * k;
-      g.scale.set(sc, sc, sc);
-      g.position.set(p.x, Math.max(0.6, p.y), -RUN.START_DISTANCE * Z_PER_DIST);
-      g.visible = true;
-    }
-    for (; i < ghosts.length; i++) ghosts[i].visible = false;
-  }
-
-  function hideGhosts() { for (var i = 0; i < ghosts.length; i++) ghosts[i].visible = false; }
-
   /* ---------- 베이스 ---------- */
 
-  function setBaseApproach(progress, isHome) {
+  function setBaseApproach(progress) {
     if (progress < 0) progress = 0;
     baseMarker.visible = true;
-    baseMarker.material.color.setHex(isHome ? 0xffe14d : 0xffffff);
     baseMarker.position.z = -40 * (1 - Math.min(1.06, progress)) + 1.4;
   }
 
@@ -534,14 +443,12 @@ var Scene3D = (function () {
     aura.visible = false;
     hidePitch();
     clearObstacles();
-    hideGhosts();
   }
 
   /* ---------------------------------------------------------- */
 
   function update(dt) {
     resize();
-    ringPulse += dt;
 
     if (poseTimer > 0) {
       poseTimer -= dt;
@@ -555,7 +462,7 @@ var Scene3D = (function () {
     cur.legR   += (pose.legR   - cur.legR)   * k;
     cur.crouch += (pose.crouch - cur.crouch) * k;
 
-    /* 달리기 — sin 스윙과 상하 바운스뿐이다 */
+    /* 달리기 — sin 스윙과 상하 바운스뿐이다 (§26) */
     var running = runSpeed > 0.1;
     if (running) runPhase += dt * 11 * Math.max(1, runSpeed / 15);
     var sw = running ? Math.sin(runPhase) : 0;
@@ -566,8 +473,7 @@ var Scene3D = (function () {
     hipL.rotation.z = -cur.legL * 1.15;
     hipR.rotation.z =  cur.legR * 1.15;
 
-    var batting = view === 'bat' || view === 'pitch';
-    if (!batting) {
+    if (mode === 'run') {
       armL.rotation.x = -sw * 0.75;
       armR.rotation.x = sw * 0.75;
     } else {
@@ -576,7 +482,7 @@ var Scene3D = (function () {
     }
 
     /* 타석에서는 타자를 옆으로 비켜 세워 공의 궤적이 가려지지 않게 한다 */
-    var wantBaseX = batting ? BATTER_X : 0;
+    var wantBaseX = (mode === 'bat') ? -0.62 : 0;
     baseX += (wantBaseX - baseX) * Math.min(1, dt * 5);
 
     lean.rotation.z = cur.leanZ;
@@ -584,7 +490,7 @@ var Scene3D = (function () {
     player.position.x = baseX + cur.offX;
     player.position.y = -cur.crouch * 0.25 + Math.max(cur.legL, cur.legR) * 0.14;
 
-    if (aura.visible) aura.material.opacity = 0.10 + Math.abs(Math.sin(runPhase * 0.5)) * 0.10;
+    if (aura.visible) aura.material.opacity = 0.16 + Math.abs(Math.sin(runPhase * 0.5)) * 0.14;
 
     if (swingT >= 0) {
       swingT += dt;
@@ -615,15 +521,10 @@ var Scene3D = (function () {
     var ck = Math.min(1, dt * 4.5);
     camPos.lerp(camPosTarget, ck);
     camLook.lerp(camLookTarget, ck);
-    if (Math.abs(camera.fov - fovTarget) > 0.05) {
-      camera.fov += (fovTarget - camera.fov) * ck;
-      camera.updateProjectionMatrix();
-    }
     camera.position.copy(camPos);
     if (shakeAmt > 0.001) {
-      var amp = shakeAmt * camera.fov / 58;      // 좁은 화각(투수 시점)에서 흔들림이 과해지지 않게
-      camera.position.x += (Math.random() - 0.5) * amp;
-      camera.position.y += (Math.random() - 0.5) * amp;
+      camera.position.x += (Math.random() - 0.5) * shakeAmt;
+      camera.position.y += (Math.random() - 0.5) * shakeAmt;
       shakeAmt *= Math.pow(0.02, dt);
     }
     camera.lookAt(camLook);
@@ -632,10 +533,10 @@ var Scene3D = (function () {
   function render() { renderer.render(scene, camera); }
 
   return {
-    init: init, resize: resize, setView: setView, setRunning: setRunning,
-    dodge: dodge, hitReaction: hitReaction, fall: fall, shake: shake, setAura: setAura,
+    init: init, resize: resize, setMode: setMode, setRunning: setRunning,
+    dodge: dodge, hitReaction: hitReaction, shake: shake, setAura: setAura,
     swing: swing, setPitch: setPitch, hidePitch: hidePitch, launchHitBall: launchHitBall,
-    syncObstacles: syncObstacles, clearObstacles: clearObstacles, syncPreview: syncPreview,
+    syncObstacles: syncObstacles, clearObstacles: clearObstacles,
     setBaseApproach: setBaseApproach, hideBase: hideBase, passBase: passBase,
     resetPlayer: resetPlayer, update: update, render: render
   };

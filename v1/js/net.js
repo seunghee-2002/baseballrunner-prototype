@@ -35,7 +35,7 @@ var Net = (function () {
     try { this.ws.close(); } catch (e) { /* 이미 닫힘 */ }
   };
 
-  /* humanRole: 사람이 맡을 역할 'ATTACK' | 'DEFENSE'. 연습은 반 이닝(공격 3회)만 한다. */
+  /* humanRole: 사람이 맡을 역할 'ATTACK' | 'DEFENSE'. 연습은 반 이닝(3아웃)만 한다. */
   function LocalLink(humanRole) {
     var self = this;
     this.closed = false;

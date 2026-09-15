@@ -1,7 +1,7 @@
 /* =============================================================
    game.js — 앱 흐름과 화면 (로비 → 매치 → 결과)
    역할에 맞춰 공격(AttackSide)·수비(DefenseSide)를 붙이고,
-   두 역할 모두 공격자 스냅숏 하나로 연출을 만든다. 카메라(뷰)만 역할마다 다르다.
+   두 역할 모두 공격자 스냅숏 하나로 같은 장면과 연출을 만든다.
    ============================================================= */
 
 (function () {
@@ -9,7 +9,6 @@
   var stage;
   var last = 0;
   var DEBUG = /[?&]debug\b/.test(location.search);
-  var DECK_KEY = 'bar.v2.deck';
 
   var App = {
     mode: 'LOBBY',        // LOBBY | WAITING | MATCH | OVER
@@ -20,34 +19,21 @@
     role: null,
     side: null,           // 내 AttackSide / DefenseSide
     bot: null,            // 연습 모드 상대 { side, brain }
-    inning: 1,
     half: 'TOP',
     scores: [0, 0],
     outs: 0,
-    atBat: null,          // 마지막 AT_BAT_START
-    deck: loadDeck(),
-    deckDraft: null
+    atBat: null           // 마지막 AT_BAT_START
   };
 
   /* 스냅숏 차이로 연출을 만들기 위한 화면 상태 */
   var V = { seq: -1, phase: '', lastEvent: 0, armed: {}, result: null, resultAt: 0, resultShown: false };
 
-  var GRADE_COLOR = { PERFECT: '#ffe14d', GREAT: '#7ef2c0', GOOD: '#ffffff', BAD: '#9aa4b8', LUCKY: '#7ef2c0' };
-  var STRIKE_TEXT = {
-    NO_SWING: '스윙하지 않았다', EARLY: '너무 빨랐다', LATE: '너무 늦었다',
-    DIAGONAL: '코스를 완전히 잘못 읽었다', BALL_SWING: '볼에 스윙했다'
+  var BAT_COLOR = { JUST: '#ff5ad0', PERFECT: '#ffe14d', GREAT: '#7ef2c0', GOOD: '#ffffff', LUCKY: '#7ef2c0' };
+  var MISS_TEXT = { NO_SWING: '스윙하지 않았다', EARLY: '너무 빨랐다', LATE: '너무 늦었다' };
+  var OUT_TEXT = {
+    MISS: '', GAUGE: '런 게이지가 바닥났다', NO_REACTION: '한 구간에서 두 번 반응하지 못했다',
+    NO_DODGE: '이 구간에서 하나도 피하지 못했다'
   };
-
-  /* ---------------- 덱 ---------------- */
-
-  function loadDeck() {
-    try { return validDeck(JSON.parse(localStorage.getItem(DECK_KEY))); } catch (e) { return DEFAULT_DECK.slice(); }
-  }
-
-  function saveDeck(deck) {
-    App.deck = validDeck(deck);
-    try { localStorage.setItem(DECK_KEY, JSON.stringify(App.deck)); } catch (e) { /* 저장 불가 — 이번 세션만 */ }
-  }
 
   /* ---------------- 연결 ---------------- */
 
@@ -68,11 +54,10 @@
     UI.setDefBar(false);
     UI.setScores(0, null);
     UI.setOuts(0);
-    UI.setCount(0, 0);
     UI.setInning('');
-    UI.setAttacks('');
+    UI.setStage('');
     UI.showLobby(location.protocol === 'file:'
-      ? 'PvP 는 <b>node server.js</b> 로 띄운 주소에서 접속해야 합니다' : '', App.deck);
+      ? 'PvP 는 <b>node server.js</b> 로 띄운 주소에서 접속해야 합니다' : '');
   }
 
   function leaveWithMessage(main, text) {
@@ -116,12 +101,7 @@
     botEp.onMessage(function (type, p) {
       if (type === 'MATCH_START') {
         if (p.role === 'ATTACK') { bot.side = new AttackSide(botEp); bot.brain = new BotBatter(bot.side); }
-        else {
-          /* 봇 덱: 8종 중 무작위 6장 */
-          var pool = CARD_POOL.slice().sort(function () { return Math.random() - 0.5; });
-          bot.side = new DefenseSide(botEp, { deck: pool.slice(0, DEFENSE.DECK_SIZE) });
-          bot.brain = new BotDefender(bot.side);
-        }
+        else { bot.side = new DefenseSide(botEp); bot.brain = new BotDefender(bot.side); }
       }
       if (!bot.side) return;
       bot.side.handle(type, p);
@@ -148,37 +128,34 @@
       case 'MATCH_START':
         App.mode = 'MATCH';
         App.me = p.you;
-        App.inning = p.inning;
         App.half = p.half;
         App.scores = p.scores;
         App.outs = 0;
         setRole(p.role);
-        UI.showRoleIntro(p.role, App.practice ? '연습 · 반 이닝 (공격 ' + p.attacks + '회)' : UI.inningText(p.inning, p.half));
+        UI.showRoleIntro(p.role, p.half, App.practice);
         break;
       case 'INNING_CHANGE':
-        App.inning = p.inning;
         App.half = p.half;
         App.scores = p.scores;
         App.outs = 0;
         setRole(p.role);
-        UI.showInningChange(p.role, p.inning, p.half, p.scores[App.me] + ' : ' + p.scores[1 - App.me],
-          p.handicap === null ? null : (p.handicap === App.me ? 'ME' : 'OPP'));
+        UI.showInningChange(p.role, p.scores[App.me] + ' : ' + p.scores[1 - App.me]);
         break;
       case 'AT_BAT_START':
         App.atBat = p;
         App.outs = p.outs;
         App.scores = p.scores;
-        App.inning = p.inning;
         App.half = p.half;
         UI.hideOverlay();
         resetView();
         break;
-      case 'AT_BAT_END':
+      case 'SAFE':
+      case 'OUT_OCCURRED':      // 상대 타석의 결과 (수비자에게만 온다)
         App.scores = p.scores;
-        App.outs = p.outs;
+        if (type === 'OUT_OCCURRED') App.outs = p.currentOuts;
         queueResult({
-          mine: App.role === 'ATTACK', out: p.out, reason: p.reason, bases: p.bases, walk: p.walk,
-          batGrade: p.batGrade, livesStart: p.livesStart, livesLeft: p.livesLeft, stats: p.stats, gained: p.gained
+          mine: false, out: type === 'OUT_OCCURRED', reason: p.reason, bases: p.bases || 0,
+          startChance: p.startChance, batGrade: p.batGrade, mishit: p.mishit, stats: p.stats, gained: p.gained || 0
         });
         break;
       case 'GAME_OVER':
@@ -191,7 +168,7 @@
   function setRole(role) {
     App.role = role;
     var ep = App.practice ? App.link.endpoints[0] : App.link;
-    App.side = role === 'ATTACK' ? new AttackSide(ep, { debug: { fan: DEBUG } }) : new DefenseSide(ep, { deck: App.deck });
+    App.side = role === 'ATTACK' ? new AttackSide(ep, { debug: { fan: DEBUG } }) : new DefenseSide(ep);
     UI.setRole(role);
     UI.setDefBar(role === 'DEFENSE');
     resetView();
@@ -204,7 +181,7 @@
     if (App.practice) {
       var att = App.practiceRole === 'ATTACK';
       UI.showGameOver({
-        sub: '연습 종료', title: att ? '내 점수' : '내준 점수',
+        sub: '연습 종료 · 3 OUTS', title: att ? '내 점수' : '내준 점수',
         score: p.scores[att ? 0 : 1], color: '#ffe14d',
         actions: [['retry', '다시'], ['lobby', '로비로']]
       });
@@ -212,7 +189,7 @@
     }
     var result = p.winner === null ? 'DRAW' : (p.winner === App.me ? 'WIN' : 'LOSE');
     UI.showGameOver({
-      sub: MATCH.INNINGS + '이닝 종료', title: { WIN: '승리', LOSE: '패배', DRAW: '무승부' }[result],
+      sub: '1이닝 종료', title: { WIN: '승리', LOSE: '패배', DRAW: '무승부' }[result],
       score: p.scores[App.me] + ' : ' + p.scores[1 - App.me],
       color: { WIN: '#ffe14d', LOSE: '#ff4b4b', DRAW: '#ffffff' }[result],
       actions: [['lobby', '로비로']]
@@ -222,7 +199,7 @@
   /* 결과 화면은 도착·아웃 순간을 잠깐 보여준 뒤 띄운다. 다음 타석이 시작되면 닫힌다. */
   function queueResult(d) {
     V.result = d;
-    V.resultAt = performance.now() + 450;
+    V.resultAt = performance.now() + 550;
     V.resultShown = false;
   }
 
@@ -235,15 +212,19 @@
     V.armed = {};
     V.result = null;
     V.resultShown = false;
-    Scene3D.setView(App.role === 'DEFENSE' ? 'pitch' : 'bat');
+    Scene3D.setMode('bat');
     Scene3D.setRunning(0);
     Scene3D.resetPlayer();
+    UI.hideHint();
+    UI.showPick(null);
     UI.setDust(false);
-    UI.setDustWarn(false);
+    UI.setCombo(0);
     UI.setWait('');
-    UI.setRunHud(false);
-    UI.resetHearts();
-    UI.setCount(0, 0);
+    UI.setGaugeVisible(false);
+    UI.setGauge(RUN.GAUGE_START);
+    UI.setFever(0, false);
+    UI.setChance(1, App.mode === 'MATCH' ? 'AT BAT' : 'READY', false);
+    UI.setBaseTrack(0, 0);
   }
 
   function currentSnap() {
@@ -252,27 +233,22 @@
     return App.side.liveView();
   }
 
-  function refreshHud(s) {
+  function refreshHud() {
     var a = App.atBat;
     if (App.practice) UI.setScores(App.scores[App.practiceRole === 'ATTACK' ? 0 : 1], null);
     else UI.setScores(App.scores[App.me], App.scores[1 - App.me]);
-    UI.setInning(App.practice ? '연습' : UI.inningText(App.inning, App.half));
+    UI.setInning(App.practice ? '연습' : UI.HALF_NAME[App.half]);
     UI.setOuts(App.outs);
-    UI.setAttacks(a ? '공격 ' + a.attackNo + ' / ' + a.attacksTotal : '');
-    if (s) UI.setCount(s.strikes, s.balls);
-  }
-
-  function isBatting(s) {
-    return s.phase === 'WAIT_PITCH' || s.phase === 'PITCH' || s.phase === 'BAT_RESULT' || (s.phase === 'DONE' && !s.leg);
+    UI.setStage(a ? 'AT BAT ' + a.atBat + ' · Lv.' + a.level : '');
   }
 
   function renderMatch() {
-    var s = currentSnap();
-    refreshHud(s);
+    refreshHud();
     if (App.mode !== 'MATCH' || !App.side) return;
 
+    var s = currentSnap();
     if (App.role === 'DEFENSE') renderDefense(s);
-    else UI.setWait(s && s.phase === 'WAIT_PITCH' ? '투수가 공을 고르는 중…' : '');
+    else UI.setWait(s && s.phase === 'WAIT_PITCH' ? '투수가 코스를 고르는 중…' : '');
 
     if (V.result && !V.resultShown && performance.now() >= V.resultAt) {
       V.resultShown = true;
@@ -289,67 +265,86 @@
     }
     if (s.phase !== V.phase) { enterPhase(s); V.phase = s.phase; }
 
-    var batting = isBatting(s);
-    var att = App.role === 'ATTACK';
-    Scene3D.setView(batting ? (att ? 'bat' : 'pitch') : (att ? 'run' : 'field'));
-    if (s.pitch && (s.phase === 'PITCH' || (s.phase === 'BAT_RESULT' && s.bat && s.bat.outcome !== 'HIT'))) {
-      Scene3D.setPitch(s.pitch);
+    /* 내 타석 결과 — 수비자는 SAFE / OUT_OCCURRED 패킷으로 받는다 */
+    if (App.role === 'ATTACK' && s.phase === 'DONE' && !V.result && s.result) {
+      var r = s.result, gained = r.out ? 0 : (CHANCE_SCORE[r.bases] || 0);
+      if (r.out) App.outs++;
+      else App.scores[App.me] += gained;
+      queueResult({
+        mine: true, out: r.out, reason: r.reason, bases: r.bases, startChance: s.bat ? s.bat.chance : 0,
+        batGrade: s.bat ? s.bat.grade : '', mishit: s.bat && s.bat.mishit, stats: s.stats, gained: gained
+      });
     }
-    if (batting) return;
 
-    var running = s.phase === 'RUNNING';
-    Scene3D.setRunning(running ? (s.leg.boosted ? BOOST_MUL : 1) : 0);
-    Scene3D.syncObstacles(s.obstacles);
-    Scene3D.syncPreview(!att && running ? s.preview : []);
-    Scene3D.setAura(running && s.leg.boosted);
-    renderArmed(s);
+    var missed = !!(s.bat && s.bat.grade === 'MISS');
+    var batting = s.phase === 'WAIT_PITCH' || s.phase === 'PITCH' || s.phase === 'BAT_RESULT' ||
+      (s.phase === 'DONE' && missed);
+    Scene3D.setMode(batting ? 'bat' : 'run');
+    if (s.pitch && (s.phase === 'PITCH' || (missed && batting))) Scene3D.setPitch(s.pitch);
 
-    if (running) {
-      Scene3D.setBaseApproach(s.leg.time / s.leg.duration, s.leg.index === HOME - 1);
-      var next = BASE_NAME[s.leg.index];
-      UI.setLeg(next + '까지' + (s.leg.boosted ? ' · 가속 중 (' + BASE_NAME[s.boostLegs - 1] + '까지)' : ''),
-        s.leg.time / s.leg.duration, s.leg.boosted);
-    } else {
-      Scene3D.hideBase();
-    }
-    UI.setHearts(s.lives, Math.max(s.livesStart, s.lives));
-    UI.setDust(att && s.dust > 0);
-    UI.setDustWarn(att && s.dustWarn);
-  }
-
-  function renderDefense(s) {
-    var side = App.side, st = side.state, i;
-    UI.setCostInfo(st.cost, st.cooldown);
-
-    if (st.selecting) {
-      var blocks = [];
-      for (i = 0; i < st.pitchHand.length; i++) blocks.push(st.pitchBlock(i));
-      var picking = st.pitchStage === 'PICK';
-      UI.renderPitchHand(st.pitchHand, st.pitchPick, blocks, picking);
-      UI.setWait(picking
-        ? '구질 선택 ' + Math.max(0, st.pitchLeft).toFixed(1) + '초 · 안 고르면 직구'
-        : '칸 선택 ' + Math.max(0, st.pitchLeft).toFixed(1) + '초 · 안 고르면 무작위 칸');
+    if (batting) {
+      renderBatHint(s);
       return;
     }
 
-    if (s && s.phase === 'RUNNING') {
-      var reasons = [];
-      for (i = 0; i < st.hand.length; i++) reasons.push(st.blockReason(i, s));
-      UI.renderHand(st.hand, reasons);
-    } else if (s && s.phase !== 'DONE' && isBatting(s)) {
-      UI.renderPitchHand(st.pitchHand, null, ['', '', ''], false);
-    } else {
-      UI.renderHand(st.hand, st.hand.map(function () { return 'PHASE'; }));
-    }
-    UI.setWait('');
+    var runningNow = s.phase === 'RUNNING' || s.phase === 'CHANCE';
+    Scene3D.setRunning(s.phase === 'HR_RUN' ? 2.2 : (runningNow ? (s.invincible > 0 ? RUN.FEVER_DASH : 1) : 0));
+    Scene3D.syncObstacles(s.obstacles);
+    Scene3D.setAura(s.invincible > 0 || s.phase === 'HR_RUN');
+    renderBase(s);
+    renderRunHint(s);
+
+    UI.setGauge(s.gauge);
+    UI.setFever(s.fever, App.role === 'ATTACK' && s.phase === 'RUNNING' && s.invincible <= 0);
+    UI.setCombo(s.combo);
+    UI.setChance(s.phase === 'HR_RUN' ? 4 : s.chance, s.phase === 'HR_RUN' ? 'HOME RUN' : CHANCE_LABEL[s.chance] + ' CHANCE', false);
+    UI.setBaseTrack(s.base, Math.max(s.chance, s.base));
+    UI.setDust(App.role === 'ATTACK' && s.dust > 0);
   }
 
-  /* 위험이 유효 창에 들어온 순간 그 칸을 번쩍인다 (정답이 아니라 위험 위치) */
-  function renderArmed(s) {
+  function renderDefense(s) {
+    var side = App.side, st = side.state, reasons = [];
+    for (var i = 0; i < st.hand.length; i++) reasons.push(st.blockReason(i, s));
+    UI.renderHand(st.hand, st.cost, reasons, st.lock);
+    document.getElementById('defBar').classList.toggle('picking', side.selecting);
+    if (side.selecting) {
+      UI.showPick(st.pitchFirst);
+      UI.setWait('코스 선택 ' + Math.max(0, st.pitchLeft).toFixed(1) + '초 · ' +
+        (st.pitchFirst ? '도착 칸' : '시작 칸') + ' — 같은 칸 두 번 = 직구');
+    } else {
+      UI.showPick(null);
+      UI.setWait('');
+    }
+  }
+
+  /* Lv.1 학습 힌트 — 공격자 화면에만. 타격은 도착 칸이 눈에 확정되는 순간부터 */
+  function renderBatHint(s) {
+    if (App.role !== 'ATTACK' || s.level !== 1 || s.phase !== 'PITCH') { UI.hideHint(); return; }
+    var known = s.pitch.type === 'FAST' || s.pitch.t / s.pitch.dur >= PITCH.BREAK_AT;
+    UI.showHints(known ? [s.pitch.end] : []);
+  }
+
+  function renderRunHint(s) {
+    var hints = [];
     for (var i = 0; i < s.obstacles.length; i++) {
       var o = s.obstacles[i];
       if (o.resolved || o.distance <= 0 || o.distance / o.speed > o.window) continue;
+      /* 위험이 유효 창에 들어온 순간 그 사분면을 알린다 (정답이 아니라 위험 위치) */
       if (!V.armed[o.id]) { V.armed[o.id] = true; UI.armZone(o.zone); }
+      if (hints.indexOf(o.required) < 0) hints.push(o.required);
+    }
+    if (App.role === 'ATTACK' && s.level === 1 && s.phase === 'RUNNING') UI.showHints(hints);
+    else UI.hideHint();
+  }
+
+  function renderBase(s) {
+    if (s.phase === 'RUNNING' && s.leg) {
+      Scene3D.setBaseApproach(s.leg.time / s.leg.duration);
+    } else if (s.phase === 'HR_RUN') {
+      var span = RUN.HR_RUN_TIME / (HOME_RUN - s.hrFrom);
+      Scene3D.setBaseApproach((s.t % span) / span);
+    } else {
+      Scene3D.hideBase();
     }
   }
 
@@ -357,18 +352,19 @@
     switch (s.phase) {
       case 'WAIT_PITCH':
         Scene3D.hidePitch();
-        UI.setRunHud(false);
+        UI.setGaugeVisible(false);
+        UI.setChance(1, 'AT BAT', false);
         break;
+      case 'CHANCE':
       case 'RUNNING':
-        UI.setRunHud(true);
+        UI.setGaugeVisible(true);
         break;
       case 'DONE':
         Scene3D.clearObstacles();
-        Scene3D.syncPreview([]);
         Scene3D.hideBase();
         Scene3D.setAura(false);
+        UI.hideHint();
         UI.setDust(false);
-        UI.setDustWarn(false);
         break;
     }
   }
@@ -388,15 +384,32 @@
         break;
 
       case 'bat':
-        playBat(e);
+        if (e.grade === 'MISS') {
+          UI.callout('MISS', '#ff4b4b');
+          UI.sub(e.reason === 'DIAGONAL' ? '공은 ' + ZONE_ARROW[e.end] + ' 로 왔다 — 코스를 완전히 잘못 읽었다' : MISS_TEXT[e.reason]);
+          UI.Sfx.fail();
+          Scene3D.shake(0.25);
+          break;
+        }
+        if (e.lucky) {
+          UI.callout('LUCKY!', BAT_COLOR.LUCKY);
+          UI.sub('빗맞았지만 ' + CHANCE_LABEL[e.chance] + ' CHANCE — 수비 코스트 -' + LUCKY.COST_PENALTY);
+        } else if (e.mishit) {
+          UI.callout('빗맞았다', '#ffffff');
+          UI.sub('공은 ' + ZONE_ARROW[e.end] + ' 로 왔다 — 겨우 1루타');
+        } else {
+          UI.callout(e.grade, BAT_COLOR[e.grade]);
+          if (e.grade === 'JUST' || e.grade === 'PERFECT') UI.sub('1·2루 구간 가속');
+        }
+        UI.Sfx.hit(e.grade);
+        Scene3D.launchHitBall(e.grade === 'JUST' ? 1.4 : e.chance / 3);
+        Scene3D.shake(e.grade === 'JUST' ? 0.34 : 0.18);
         break;
 
-      case 'run':
-        UI.setHearts(e.lives, e.lives);
-        if (e.walk) {
-          UI.callout('BALL 2', '#7ef2c0');
-          UI.sub('2루에서 출발 — 생명 ' + e.lives);
-        }
+      case 'chance':
+        UI.setChance(e.chance, CHANCE_LABEL[e.chance] + ' CHANCE', true);
+        UI.callout(CHANCE_LABEL[e.chance] + ' CHANCE!', e.chance >= 3 ? '#ffe14d' : '#7ef2c0');
+        UI.sub(e.chance >= 3 ? '피버를 채워 발동하면 HOME RUN' : '끝까지 피해 세이프를 만든다');
         break;
 
       case 'verdict':
@@ -413,92 +426,75 @@
       case 'base':
         Scene3D.passBase();
         UI.Sfx.base();
-        if (e.base < HOME) UI.callout(BASE_NAME[e.base - 1] + ' 통과!', '#7ef2c0');
+        /* 마지막 베이스는 SAFE 문구가 대신한다. 홈런 질주는 베이스마다 보여준다. */
+        if (s.phase === 'HR_RUN' || e.base < s.chance) {
+          UI.callout(BASE_NAME[e.base - 1] + (e.base >= HOME_RUN ? ' 인!' : ' 통과!'), '#7ef2c0');
+        }
+        break;
+
+      case 'fever':
+        UI.callout('FEVER!', '#ff5ad0');
+        UI.sub('무적 돌진 — 런 게이지 +' + RUN.FEVER_GUARD_GAUGE);
+        UI.flash('rgba(255,110,220,.45)');
+        UI.Sfx.fever();
+        break;
+
+      case 'homerun':
+        UI.callout('HOME RUN!!', '#ff5ad0');
+        UI.sub('3B + 피버 — 홈까지 무적 질주');
+        UI.flash('rgba(255,110,220,.55)');
+        UI.Sfx.homerun();
+        Scene3D.shake(0.55);
         break;
 
       case 'card':
-        /* 어떤 카드를 언제 썼는지는 공격자에게 알리지 않는다. 수비자에게만 발동 확인을 준다. */
+        /* 기습은 공격자에게 알리지 않는다. 수비자에게만 발동 확인을 준다. */
         if (!mine) { UI.sub(CARDS[e.cardId].name + ' 발동'); UI.Sfx.card(); }
-        break;
-
-      case 'down':
-        Scene3D.fall();
-        UI.callout('여기까지', '#ffe14d');
-        UI.sub(BASE_NAME[e.bases - 1] + ' 세이프');
-        UI.flash('rgba(255,64,64,.35)');
-        UI.Sfx.fail();
         break;
 
       case 'out':
         Scene3D.hitReaction();
         Scene3D.shake(0.9);
-        UI.callout('OUT', '#ff4b4b');
-        UI.sub(e.reason === 'STRIKEOUT' ? '삼진' : '1루에 닿지 못했다');
+        UI.callout('OUT!', '#ff4b4b');
+        UI.sub(OUT_TEXT[e.reason] || '');
         UI.flash('rgba(255,0,0,.55)');
         UI.Sfx.out();
         break;
 
-      case 'homerun':
-        UI.callout('HOME RUN!!', '#ff5ad0');
-        UI.sub('끝까지 달렸다');
-        UI.flash('rgba(255,110,220,.55)');
-        UI.Sfx.homerun();
-        Scene3D.shake(0.55);
+      case 'safe':
+        if (e.bases < HOME_RUN) UI.callout('SAFE!  ' + CHANCE_LABEL[e.bases], '#7ef2c0');
         break;
     }
   }
 
-  function playBat(e) {
-    if (e.grade === 'BALL') {
-      UI.callout('BALL', '#7ef2c0');
-      UI.sub(e.balls >= COUNT.BALL_WALK ? '2루 출루' : '볼 ' + e.balls);
-      UI.Sfx.ball();
-      return;
-    }
-    if (e.grade === 'STRIKE') {
-      var out = e.strikes >= COUNT.STRIKE_OUT;
-      if (e.reason === 'FOUL') {
-        UI.callout('FOUL', '#ffffff');
-        UI.sub('공은 ' + ZONE_ARROW[e.end] + ' 로 왔다' + (out ? ' — 스트라이크 2' : ''));
-      } else {
-        UI.callout('STRIKE', '#ff4b4b');
-        UI.sub((e.reason === 'DIAGONAL' ? '공은 ' + ZONE_ARROW[e.end] + ' 로 왔다 — ' : '') + STRIKE_TEXT[e.reason]);
-      }
-      UI.Sfx.strike();
-      Scene3D.shake(0.2);
-      return;
-    }
-    if (e.grade === 'LUCKY') {
-      UI.callout('LUCKY!', GRADE_COLOR.LUCKY);
-      UI.sub('빗맞았지만 살았다 — 생명 ' + e.lives);
-    } else {
-      UI.callout(e.grade, GRADE_COLOR[e.grade]);
-      UI.sub('생명 ' + e.lives + (e.boostLegs ? ' · ' + BASE_NAME[e.boostLegs - 1] + '까지 가속' : ''));
-    }
-    UI.Sfx.hit(e.grade);
-    Scene3D.launchHitBall(e.lives / 2);
-    Scene3D.shake(e.grade === 'PERFECT' ? 0.34 : 0.18);
-  }
-
   function playVerdict(e) {
-    if (e.verdict !== 'BAD') {
+    UI.hideHint();
+    if (e.verdict === 'FEVER') return;
+
+    if (e.verdict === 'PERFECT' || e.verdict === 'NICE') {
       Scene3D.dodge(e.required);
-      UI.callout(e.verdict + '!', GRADE_COLOR[e.verdict]);
-      if (e.verdict === 'PERFECT') { UI.flash('rgba(255,225,77,.42)'); UI.Sfx.perfect(); }
-      else UI.Sfx.dodge();
+      if (e.verdict === 'PERFECT') {
+        UI.callout(e.combo >= 3 ? 'PERFECT ×' + e.combo : 'PERFECT!', '#ffe14d');
+        UI.flash('rgba(255,225,77,.42)');
+        UI.Sfx.perfect();
+      } else {
+        UI.callout(e.combo >= 3 ? 'NICE ×' + e.combo : 'NICE!', '#7ef2c0');
+        UI.Sfx.dodge();
+      }
+      if (e.kind === 'fan') UI.sub('난입한 관객을 피했다! 피버 +' + OBSTACLES.FAN_LT.reward.fever);
       return;
     }
 
-    /* 잘못 누른 쪽으로 실제로 피한 뒤 맞는다 (반응 없음이면 그대로 맞는다) — 왜 맞았는지 보여야 한다 */
+    /* 잘못 누른 쪽으로 실제로 피한 뒤 맞는다 — 왜 맞았는지 보여야 한다 (§37) */
     if (e.pressed) Scene3D.dodge(e.pressed);
     Scene3D.hitReaction();
     UI.flash('rgba(255,64,64,.5)');
     UI.Sfx.fail();
-    UI.callout('BAD', '#ff4b4b');
-    UI.sub((e.pressed ? '틀린 칸 — ' : '반응 없음 — ') + '정답 ' + ZONE_ARROW[e.required] + ' ' + ACTION_NAME[e.required]);
+    UI.callout(e.verdict === 'WRONG' ? 'WRONG!' : 'TOO LATE!', '#ff4b4b');
+    UI.sub('정답 ' + ZONE_ARROW[e.required] + ' ' + ACTION_NAME[e.required]);
   }
 
-  /* ---------------- 입력 ---------------- */
+  /* ---------------- 입력 (§8) ---------------- */
 
   function onZone(zone) {
     UI.Sfx.unlock();
@@ -511,32 +507,23 @@
     else if (sim.phase === 'RUNNING') sim.dodge(zone);
   }
 
-  /* 수비자 손패 i. 투구 선택 중이면 투구 카드(-1 = 직구), 아니면 장애물 카드 */
-  function onCard(i, pitchSlot) {
-    UI.Sfx.unlock();
-    if (App.mode !== 'MATCH' || App.role !== 'DEFENSE' || !App.side) return;
-    if (App.side.state.selecting) { if (pitchSlot !== undefined) App.side.pickPitch(pitchSlot); return; }
-    if (i >= 0 && App.side.playCard(i)) UI.pulseCard(i);
+  function onFever() {
+    if (App.role === 'ATTACK' && App.side && App.side.sim) App.side.sim.activateFever();
   }
 
-  function onAction(act, id) {
+  function onCard(i) {
+    UI.Sfx.unlock();
+    if (App.mode !== 'MATCH' || App.role !== 'DEFENSE' || !App.side) return;
+    if (App.side.playCard(i)) UI.pulseCard(i);
+  }
+
+  function onAction(act) {
     UI.Sfx.unlock();
     if (act === 'pvp') startPvp();
     else if (act === 'practice-attack') startPractice('ATTACK');
     else if (act === 'practice-defense') startPractice('DEFENSE');
     else if (act === 'retry') startPractice(App.practiceRole);
-    else if (act === 'lobby') { App.deckDraft = null; toLobby(); }
-    else if (act === 'deck') { App.deckDraft = App.deck.slice(); UI.showDeckEditor(App.deckDraft); }
-    else if (act === 'deck-toggle' && App.deckDraft) {
-      var at = App.deckDraft.indexOf(id);
-      if (at >= 0) App.deckDraft.splice(at, 1);
-      else if (App.deckDraft.length < DEFENSE.DECK_SIZE) App.deckDraft.push(id);
-      UI.showDeckEditor(App.deckDraft);
-    } else if (act === 'deck-save' && App.deckDraft && App.deckDraft.length === DEFENSE.DECK_SIZE) {
-      saveDeck(App.deckDraft);
-      App.deckDraft = null;
-      toLobby();
-    }
+    else if (act === 'lobby') toLobby();
   }
 
   function zoneFromPoint(cx, cy) {
@@ -551,30 +538,35 @@
   function bind() {
     /* 칸마다 따로 받는다 — 두 손가락으로 두 칸을 같은 순간에 눌러도 각각 판정된다 */
     stage.addEventListener('pointerdown', function (ev) {
-      if (ev.target.closest('#overlay, .card')) return;
+      if (ev.target.closest('#overlay, #feverBtn, .card')) return;
       ev.preventDefault();
       onZone(zoneFromPoint(ev.clientX, ev.clientY));
     });
 
+    document.getElementById('feverBtn').addEventListener('pointerdown', function (ev) {
+      ev.preventDefault();
+      onFever();
+    });
+
     document.getElementById('hand').addEventListener('pointerdown', function (ev) {
-      var c = ev.target.closest('.card');
+      var c = ev.target.closest('[data-card]');
       if (!c) return;
       ev.preventDefault();
-      if (c.hasAttribute('data-pitch')) onCard(-1, Number(c.getAttribute('data-pitch')));
-      else onCard(Number(c.getAttribute('data-card')));
+      onCard(Number(c.getAttribute('data-card')));
     });
 
     document.getElementById('overlay').addEventListener('click', function (ev) {
       var b = ev.target.closest('[data-act]');
-      if (b) onAction(b.getAttribute('data-act'), b.getAttribute('data-id'));
+      if (b) onAction(b.getAttribute('data-act'));
     });
 
     window.addEventListener('keydown', function (ev) {
       if (ev.repeat) return;
       var k = ev.key.toLowerCase();
       if (KEY_ZONE[k]) { ev.preventDefault(); onZone(KEY_ZONE[k]); return; }
-      if (k === 'f') { onCard(-1, -1); return; }
-      if (k >= '1' && k <= '3') { var n = Number(k) - 1; onCard(n, n); }
+      if (k === ' ') { ev.preventDefault(); onFever(); return; }
+      if (k >= '1' && k <= '4') { onCard(Number(k) - 1); return; }
+      if (DEBUG && k === 'f' && App.role === 'ATTACK' && App.side && App.side.sim) App.side.sim.fever = RUN.FEVER_MAX;
     });
   }
 

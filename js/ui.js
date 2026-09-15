@@ -1,6 +1,6 @@
 /* =============================================================
    ui.js — HUD / 손패 / 오버레이 / 간단한 효과음
-   최소한의 정보만 띄운다 (§22). 실패 이유는 반드시 글로도 보여준다 (§37).
+   주루 중에는 하트와 남은 거리만 크게 보여준다 (v2 10.3). 실패 이유는 반드시 글로도 보여준다.
    ============================================================= */
 
 var UI = (function () {
@@ -11,13 +11,10 @@ var UI = (function () {
   function $(id) { return document.getElementById(id); }
 
   function init() {
-    ['scoreMe', 'scoreSep', 'scoreOpp', 'inning', 'outs', 'roleTag', 'chance', 'gaugeWrap', 'gaugeFill',
-     'gaugeHint', 'feverWrap', 'feverFill', 'baseTrack', 'combo', 'stageInfo', 'waitInfo', 'feverBtn',
-     'defBar', 'costNum', 'lockInfo', 'hand', 'flash', 'callout', 'subCallout', 'overlay',
-     'hintLayer', 'pickLayer', 'dust'].forEach(function (id) { el[id] = $(id); });
+    ['hud', 'scoreMe', 'scoreSep', 'scoreOpp', 'inning', 'outs', 'roleTag', 'attacks', 'count', 'legBar',
+     'legName', 'legFill', 'waitInfo', 'hearts', 'defBar', 'costNum', 'cdInfo', 'hand', 'flash', 'callout',
+     'subCallout', 'overlay', 'dust', 'dustWarn'].forEach(function (id) { el[id] = $(id); });
     el.zones = document.querySelectorAll('.zone');
-    el.hintLayer.innerHTML = '<div></div><div></div><div></div><div></div>';
-    el.pickLayer.innerHTML = '<div></div><div></div><div></div><div></div>';
   }
 
   /* ---------- HUD ---------- */
@@ -32,74 +29,54 @@ var UI = (function () {
 
   function setInning(text) { el.inning.textContent = text; }
 
-  function setOuts(n) {
-    var dots = el.outs.querySelectorAll('i');
-    for (var i = 0; i < dots.length; i++) dots[i].classList.toggle('on', i < n);
+  function dots(sel, n) {
+    var list = el.hud.querySelectorAll(sel);
+    for (var i = 0; i < list.length; i++) list[i].classList.toggle('on', i < n);
   }
+
+  function setOuts(n) { dots('#outs i', n); }
+
+  function setCount(strikes, balls) {
+    dots('#count i.s', strikes);
+    dots('#count i.b', balls);
+  }
+
+  function setAttacks(text) { el.attacks.textContent = text; }
 
   function setRole(role) {
     el.roleTag.textContent = role === 'ATTACK' ? '공격' : (role === 'DEFENSE' ? '수비' : '');
     el.roleTag.className = role === 'DEFENSE' ? 'def' : 'att';
   }
 
-  function setStage(text) { el.stageInfo.textContent = text; }
+  /* 주루 중에는 점수판을 흐리게 하고 하트·거리만 또렷하게 */
+  function setRunHud(on) {
+    el.hud.classList.toggle('running', !!on);
+    el.legBar.hidden = !on;
+    el.hearts.hidden = !on;
+  }
 
-  var CHANCE_COLOR = { 0: '#ff4b4b', 1: '#ffffff', 2: '#7ef2c0', 3: '#ffe14d', 4: '#ff5ad0' };
+  function setLeg(label, progress, boosted) {
+    el.legName.textContent = label;
+    el.legFill.style.width = Math.max(0, Math.min(100, progress * 100)) + '%';
+    el.legBar.classList.toggle('boost', !!boosted);
+  }
 
-  function setChance(level, text, pop) {
-    el.chance.textContent = text;
-    el.chance.style.color = CHANCE_COLOR[level] || '#ffffff';
-    if (pop) {
-      el.chance.classList.remove('up');
-      void el.chance.offsetWidth;
-      el.chance.classList.add('up');
+  /* 하트. 줄어들면 방금 잃은 하트가 깨지는 연출 */
+  var heartKey = '';
+  function setHearts(n, max) {
+    var key = n + '/' + max;
+    if (key === heartKey) return;
+    var prev = heartKey ? Number(heartKey.split('/')[0]) : n;
+    heartKey = key;
+    var html = '';
+    for (var i = 0; i < max; i++) {
+      var cls = i < n ? 'on' : (i < prev ? 'broken' : 'off');
+      html += '<i class="' + cls + '">&#10084;</i>';
     }
+    el.hearts.innerHTML = html;
   }
 
-  function setGauge(v) {
-    el.gaugeFill.style.width = Math.max(0, Math.min(100, v)) + '%';
-    el.gaugeWrap.classList.toggle('hot', v >= 75);
-    el.gaugeWrap.classList.toggle('danger', v <= 25);
-  }
-
-  function setGaugeVisible(on) {
-    el.gaugeWrap.style.opacity = on ? '1' : '0.15';
-    el.gaugeHint.style.opacity = on ? '1' : '0';
-    el.feverWrap.style.opacity = on ? '1' : '0.15';
-  }
-
-  /* 피버: 가득 차면 상단 가운데 버튼이 뜬다 (공격자만 누를 수 있다) */
-  function setFever(v, canPress) {
-    el.feverFill.style.width = Math.max(0, Math.min(100, v)) + '%';
-    var full = v >= RUN.FEVER_MAX;
-    el.feverWrap.classList.toggle('full', full);
-    el.feverBtn.hidden = !(full && canPress);
-  }
-
-  function setCombo(n) {
-    if (n < 2) { el.combo.textContent = ''; el.combo.classList.remove('show'); return; }
-    if (el.combo.textContent === n + ' COMBO') return;
-    el.combo.textContent = n + ' COMBO';
-    el.combo.classList.remove('show');
-    void el.combo.offsetWidth;
-    el.combo.classList.add('show');
-  }
-
-  /* 베이스 트랙 — 어디까지 왔고 어디까지 갈 수 있는지 (§23). HR 은 3B 에서 피버로만. */
-  var BASE_LABEL = ['1B', '2B', '3B', 'HR'];
-  var trackKey = '';
-
-  function setBaseTrack(reached, target) {
-    var key = reached + '/' + target;
-    if (key === trackKey) return;
-    trackKey = key;
-    var html = '<b>H</b>';
-    for (var i = 0; i < 4; i++) {
-      var cls = i < reached ? 'done' : (i < target ? 'goal' : 'far');
-      html += '<s class="' + cls + '"></s><b class="' + cls + '">' + BASE_LABEL[i] + '</b>';
-    }
-    el.baseTrack.innerHTML = html;
-  }
+  function resetHearts() { heartKey = ''; el.hearts.innerHTML = ''; }
 
   function setWait(text) { el.waitInfo.textContent = text || ''; }
 
@@ -145,32 +122,12 @@ var UI = (function () {
     setTimeout(function () { z.classList.remove('armed'); }, 420);
   }
 
-  /* Lv.1 학습용 정답 힌트 (§15). 동시에 여러 칸일 수 있다. */
-  var hintKey = '';
-  function showHints(zones) {
-    var key = zones.join(',');
-    if (key === hintKey) return;
-    hintKey = key;
-    for (var i = 0; i < 4; i++) el.hintLayer.children[i].innerHTML = '';
-    zones.forEach(function (z) {
-      el.hintLayer.children[ZONE_INDEX[z]].innerHTML = '<span class="hint">' + ZONE_ARROW[z] + '</span>';
-    });
-  }
-  function hideHint() { showHints([]); }
-
-  /* 수비자 투구 선택 — 첫 번째로 고른 칸 표시 */
-  function showPick(first) {
-    for (var i = 0; i < 4; i++) {
-      var on = first && ZONE_INDEX[first] === i;
-      el.pickLayer.children[i].innerHTML = on ? '<span class="pick">시작</span>' : '';
-    }
-  }
-
   function setDust(on) { el.dust.classList.toggle('on', !!on); }
+  function setDustWarn(on) { el.dustWarn.classList.toggle('on', !!on); }
 
   /* ---------- 수비 손패 ---------- */
 
-  var BLOCK_TEXT = { COST: '코스트 부족', LOCK: '잠금', NO_TARGET: '다가오는 공 없음', TOO_LATE: '베이스 임박', PHASE: '' };
+  var BLOCK_TEXT = { COST: '코스트 부족', COOLDOWN: '쿨다운', NO_TARGET: '다가오는 공 없음', TOO_LATE: '홈 임박', PHASE: '' };
   var handKey = '';
 
   function setDefBar(on) {
@@ -178,11 +135,14 @@ var UI = (function () {
     handKey = '';
   }
 
-  /* hand: [{uid,id,zones}], reasons: 카드별 막힌 이유('' = 사용 가능) */
-  function renderHand(hand, cost, reasons, lock) {
+  function setCostInfo(cost, cooldown) {
     el.costNum.textContent = cost;
-    el.lockInfo.textContent = lock > 0 ? '  카드 잠금 ' + lock.toFixed(1) : '';
-    var key = hand.map(function (c, i) { return c.uid + reasons[i]; }).join('|');
+    el.cdInfo.textContent = cooldown > 0 ? '  쿨다운 ' + cooldown.toFixed(1) : '';
+  }
+
+  /* 장애물 손패. hand: [{uid,id,zones}], reasons: 카드별 막힌 이유('' = 사용 가능) */
+  function renderHand(hand, reasons) {
+    var key = 'H' + hand.map(function (c, i) { return c.uid + reasons[i]; }).join('|');
     if (key === handKey) return;
     handKey = key;
     var html = '';
@@ -197,6 +157,39 @@ var UI = (function () {
         (why && BLOCK_TEXT[why] ? '<span class="c-why">' + BLOCK_TEXT[why] + '</span>' : '') +
         '</div>';
     });
+    el.hand.className = 'obstacle';
+    el.hand.innerHTML = html;
+  }
+
+  /* 투구 이동 표시 — 수비자(투수 시점) 화면 기준 */
+  function moveText(card) {
+    if (!card.move) return '●';
+    if (card.move === 'DIAGONAL') return '⤡';
+    if (card.move.dc > 0) return '→';
+    if (card.move.dc < 0) return '←';
+    return card.move.dr > 0 ? '↓' : '↑';
+  }
+
+  /* 투구 손패: 직구(고정) + 3장. pick: -1 직구 / 0~2 / null, blocks: 카드별 막힌 이유
+     enabled: 구질 단계에서만 true. 칸 단계에서는 고른 카드만 또렷하고 나머지는 흐리다 */
+  function renderPitchHand(hand, pick, blocks, enabled) {
+    var key = 'P' + (enabled ? 1 : 0) + ':' + pick + ':' + hand.map(function (c, i) { return c.uid + blocks[i]; }).join('|');
+    if (key === handKey) return;
+    handKey = key;
+    function tile(card, idx, keyName, why) {
+      var picked = pick === idx;
+      return '<div class="card pitch' + ((why || !enabled) && !picked ? ' off' : '') + (picked ? ' picked' : '') +
+        '" data-pitch="' + idx + '">' +
+        '<span class="c-cost">' + card.cost + '</span>' +
+        '<span class="c-where">' + moveText(card) + '</span>' +
+        '<span class="c-name">' + card.name + '</span>' +
+        '<span class="c-type">' + card.speed + ' · ' + keyName + '</span>' +
+        (why && BLOCK_TEXT[why] ? '<span class="c-why">' + BLOCK_TEXT[why] + '</span>' : '') +
+        '</div>';
+    }
+    var html = tile(FASTBALL, -1, 'F', '');
+    hand.forEach(function (c, i) { html += tile(PITCH_CARDS[c.id], i, String(i + 1), blocks[i]); });
+    el.hand.className = 'pitching';
     el.hand.innerHTML = html;
   }
 
@@ -223,22 +216,39 @@ var UI = (function () {
     return '<div class="btn' + (dim ? ' dim' : '') + '" data-act="' + act + '">' + text + '</div>';
   }
 
-  function showLobby(pvpNote) {
+  function showLobby(pvpNote, deck) {
     overlay(
-      '<h1><span class="sub">PROTOTYPE · 1v1</span>BASEBALL<br>ACTION RUNNER</h1>' +
-      '<div class="desc">타격으로 <b>루타의 가능성</b>을 만들고<br>주루로 그 가능성을 <b>지켜낸다</b></div>' +
+      '<h1><span class="sub">PROTOTYPE v2 · 1v1</span>BASEBALL<br>ACTION RUNNER</h1>' +
+      '<div class="desc">타격으로 <b>생명</b>을 얻고<br>회피로 생명을 지키며 <b>홈까지</b> 달린다</div>' +
       '<div class="btns">' +
       btn('pvp', 'PvP 대전', !!pvpNote) +
       btn('practice-attack', '연습 · 공격') +
       btn('practice-defense', '연습 · 수비') +
+      '<div class="btn ghost" data-act="deck">덱 편집</div>' +
       '</div>' +
       (pvpNote ? '<div class="note">' + pvpNote + '</div>' : '') +
+      '<div class="deckLine">덱 ' + deck.join(' · ') + '</div>' +
       '<div class="keys">' +
-      '<b>타격</b> 공이 <b>도착하는 칸</b>을 도착 순간에<br>' +
+      '<b>타격</b> 공이 <b>도착하는 칸</b>을 도착 순간에 · 볼은 치지 않는다<br>' +
       '<b>위쪽 공</b> 반대쪽 &nbsp; <b>아래 수비수</b> 같은 쪽<br>' +
-      '<b>투구</b> 두 칸 선택 (같은 칸 = 직구)<br><br>' +
-      '&#8598; Q &nbsp; &#8599; E &nbsp; &#8601; A &nbsp; &#8600; D &nbsp;·&nbsp; 피버 SPACE &nbsp;·&nbsp; 카드 1~4' +
+      '<b>투구</b> 투구 카드를 고른 뒤 <b>시작 칸</b>을 탭<br><br>' +
+      '&#8598; Q &nbsp; &#8599; E &nbsp; &#8601; A &nbsp; &#8600; D &nbsp;·&nbsp; 카드 1~3 &nbsp;·&nbsp; 직구 F' +
       '</div>');
+  }
+
+  /* 덱 편집: 장애물 카드 8종 중 6장 */
+  function showDeckEditor(selected) {
+    var html = '<h1><span class="sub">장애물 카드 8종 중 ' + DEFENSE.DECK_SIZE + '장</span>덱 편집</h1><div class="deckGrid">';
+    CARD_POOL.forEach(function (id) {
+      var def = CARDS[id], on = selected.indexOf(id) >= 0;
+      html += '<div class="deckCard' + (on ? ' on' : '') + '" data-act="deck-toggle" data-id="' + id + '">' +
+        '<span class="c-cost">' + def.cost + '</span>' +
+        '<b>' + id + '</b><span>' + def.name + '</span><em>' + def.type + '</em></div>';
+    });
+    var ready = selected.length === DEFENSE.DECK_SIZE;
+    html += '</div><div class="deckCount">' + selected.length + ' / ' + DEFENSE.DECK_SIZE + '</div>' +
+      '<div class="btns">' + btn('deck-save', '저장', !ready) + btn('lobby', '취소') + '</div>';
+    overlay(html);
   }
 
   function showMessage(title, text, actions) {
@@ -248,48 +258,50 @@ var UI = (function () {
       '<div class="btns">' + (actions || []).map(function (a) { return btn(a[0], a[1]); }).join('') + '</div>');
   }
 
-  var HALF_NAME = { TOP: '1회 초', BOTTOM: '1회 말' };
+  var HALF_NAME = { TOP: '초', BOTTOM: '말' };
 
-  function showRoleIntro(role, half, practice) {
+  function inningText(inning, half) { return inning + '회 ' + HALF_NAME[half]; }
+
+  function showRoleIntro(role, subText) {
     var att = role === 'ATTACK';
     overlay(
-      '<h1><span class="sub">' + (practice ? '연습 · 반 이닝' : HALF_NAME[half]) + '</span>' +
-      (att ? '공격' : '수비') + '</h1>' +
+      '<h1><span class="sub">' + subText + '</span>' + (att ? '공격' : '수비') + '</h1>' +
       '<div class="desc">' + (att
-        ? '공의 궤적을 읽고 <b>도착 칸</b>을 친다<br>주루에서 피해 <b>세이프</b>를 만든다<br>3B 에서 피버를 쓰면 <b>HOME RUN</b>'
-        : '두 칸을 골라 던진다 (3초)<br>타자가 피할 때마다 코스트가 찬다<br>카드로 장애물을 기습 배치한다') +
+        ? '공의 궤적을 읽고 <b>도착 칸</b>을 친다 · 볼은 참는다<br>잘 칠수록 <b>생명</b>이 많다<br>생명이 남아 있는 한 <b>홈까지</b> 달린다'
+        : '<b>구질</b>을 고르고(' + PITCH.PICK_TIME + '초, 넘기면 직구)<br><b>시작 칸</b>을 탭한다(' + PITCH.ZONE_TIME + '초, 넘기면 무작위)<br>타석마다 코스트 +' + DEFENSE.COST_GRANT + ', 타자가 피할 때마다 +1<br>주루 중 장애물 카드로 기습한다') +
       '</div>');
   }
 
-  var OUT_REASON = {
-    MISS: '타격 실패', GAUGE: '런 게이지 고갈', NO_REACTION: '무반응 2회', NO_DODGE: '구간에서 하나도 못 피함'
-  };
+  var REASON_TEXT = { STRIKEOUT: '삼진', NO_FIRST: '1루에 닿지 못했다', LIVES: '생명 소진', HOME: '끝까지 달렸다' };
 
-  /* §20 의 결과 화면 구성. mine: 내가 친 타석인가 */
+  /* 타석 결과. mine: 내가 친 타석인가 */
   function showAtBatResult(d) {
-    var hr = !d.out && d.bases >= HOME_RUN;
-    var big = d.out ? 'OUT' : (hr ? 'HOME RUN' : CHANCE_LABEL[d.bases] + '!');
+    var hr = !d.out && d.bases >= HOME;
+    var big = d.out ? 'OUT' : BASE_LABEL[d.bases];
     var color = d.out ? '#ff4b4b' : (hr ? '#ff5ad0' : (d.bases >= 3 ? '#ffe14d' : '#ffffff'));
-    var start = d.startChance ? CHANCE_LABEL[d.startChance] + ' CHANCE' : '—';
-    var st = d.stats || { success: 0, total: 0, perfect: 0, bestCombo: 0 };
+    var reason = REASON_TEXT[d.reason] || '';
+    if (d.reason === 'LIVES') reason += ' — ' + BASE_NAME[d.bases - 1] + ' 세이프';
+    var st = d.stats || { success: 0, total: 0, perfect: 0 };
+    var batText = d.walk ? 'BALL 2 (2루 출루)' : (d.batGrade || '—');
     overlay(
       '<div class="who">' + (d.mine ? '내 타석' : '상대 타석') + '</div>' +
       '<div class="big' + (hr ? ' hr' : '') + '" style="color:' + color + '">' + big + '</div>' +
-      '<div class="chain">' + start + ' → <b>' + (d.out ? 'OUT' : CHANCE_LABEL[d.bases]) + '</b></div>' +
-      (d.out ? '<div class="reason">' + (OUT_REASON[d.reason] || '') + '</div>' : '') +
+      '<div class="reason' + (d.out ? ' bad' : '') + '">' + reason + '</div>' +
       '<div class="rows">' +
-      row('BAT', (d.batGrade || '—') + (d.mishit ? ' (빗맞음)' : '')) +
-      row('RUN', st.success + ' / ' + st.total) +
-      row('PERFECT', st.perfect) +
-      row('BEST COMBO', st.bestCombo) +
+      row('BAT', batText) +
+      (d.reason === 'STRIKEOUT' ? '' : row('생명', d.livesStart + ' → ' + d.livesLeft)) +
+      (d.reason === 'STRIKEOUT' ? '' : row('RUN', st.success + ' / ' + st.total + ' (PERFECT ' + st.perfect + ')')) +
       row('SCORE', '+' + (d.gained || 0)) +
       '</div>');
   }
 
-  function showInningChange(role, scores) {
+  /* handicap: 'ME' | 'OPP' | null — 다음 이닝 공격 +1 을 받는 쪽 */
+  function showInningChange(role, inning, half, scores, handicap) {
+    var hc = handicap === 'ME' ? '<div class="reason">점수 차 — 다음 이닝 내 공격 +1</div>'
+      : (handicap === 'OPP' ? '<div class="reason">점수 차 — 다음 이닝 상대 공격 +1</div>' : '');
     overlay(
-      '<h1><span class="sub">3 OUTS</span>공수 교대</h1>' +
-      '<div class="chain">' + scores + '</div>' +
+      '<h1><span class="sub">' + inningText(inning, half) + '</span>공수 교대</h1>' +
+      '<div class="chain">' + scores + '</div>' + hc +
       '<div class="desc">이제 <b>' + (role === 'ATTACK' ? '공격' : '수비') + '</b>입니다</div>');
   }
 
@@ -301,7 +313,7 @@ var UI = (function () {
   }
 
   /* ---------- 효과음 ----------
-     파일 없이 오실레이터만 쓴다. 회피 성공의 손맛(§30 Q3)에 필요한 최소한이다. */
+     파일 없이 오실레이터만 쓴다. */
 
   var ac = null;
 
@@ -337,13 +349,14 @@ var UI = (function () {
     swing:   function () { tone(180, 0.10, 'sawtooth', 0.05, 90); },
     pitch:   function () { tone(420, 0.05, 'triangle', 0.04); },
     hit:     function (g) {
-      if (g === 'JUST') seq([[990, 0.07], [1320, 0.07], [1760, 0.22]]);
-      else if (g === 'PERFECT') seq([[880, 0.08], [1320, 0.16]]);
-      else if (g === 'GREAT' || g === 'LUCKY') seq([[660, 0.08], [990, 0.13]]);
+      if (g === 'PERFECT') seq([[990, 0.07], [1320, 0.07], [1760, 0.22]]);
+      else if (g === 'GREAT') seq([[880, 0.08], [1320, 0.16]]);
+      else if (g === 'GOOD' || g === 'LUCKY') seq([[660, 0.08], [990, 0.13]]);
       else tone(520, 0.12, 'square', 0.07);
     },
+    ball:    function () { tone(300, 0.10, 'triangle', 0.06); },
+    strike:  function () { tone(200, 0.16, 'sawtooth', 0.07, 120); },
     homerun: function () { seq([[660, 0.09], [880, 0.09], [1100, 0.09], [1320, 0.09], [1760, 0.32]]); },
-    fever:   function () { seq([[520, 0.06], [780, 0.06], [1040, 0.14]]); },
     dodge:   function () { tone(620, 0.07, 'square', 0.06, 880); },
     perfect: function () { seq([[880, 0.06], [1180, 0.10]]); },
     whiff:   function () { tone(260, 0.09, 'triangle', 0.06, 170); },
@@ -355,14 +368,15 @@ var UI = (function () {
   };
 
   return {
-    init: init, setScores: setScores, setInning: setInning, setOuts: setOuts, setRole: setRole,
-    setStage: setStage, setChance: setChance, setGauge: setGauge, setGaugeVisible: setGaugeVisible,
-    setFever: setFever, setCombo: setCombo, setBaseTrack: setBaseTrack, setWait: setWait,
+    init: init, setScores: setScores, setInning: setInning, setOuts: setOuts, setCount: setCount,
+    setAttacks: setAttacks, setRole: setRole, setRunHud: setRunHud, setLeg: setLeg,
+    setHearts: setHearts, resetHearts: resetHearts, setWait: setWait,
     callout: callout, sub: sub, flash: flash, litZone: litZone, armZone: armZone,
-    showHints: showHints, hideHint: hideHint, showPick: showPick, setDust: setDust,
-    setDefBar: setDefBar, renderHand: renderHand, pulseCard: pulseCard,
-    hideOverlay: hideOverlay, showLobby: showLobby, showMessage: showMessage, showRoleIntro: showRoleIntro,
-    showAtBatResult: showAtBatResult, showInningChange: showInningChange, showGameOver: showGameOver,
-    HALF_NAME: HALF_NAME, Sfx: Sfx
+    setDust: setDust, setDustWarn: setDustWarn,
+    setDefBar: setDefBar, setCostInfo: setCostInfo, renderHand: renderHand, renderPitchHand: renderPitchHand,
+    pulseCard: pulseCard,
+    hideOverlay: hideOverlay, showLobby: showLobby, showDeckEditor: showDeckEditor, showMessage: showMessage,
+    showRoleIntro: showRoleIntro, showAtBatResult: showAtBatResult, showInningChange: showInningChange,
+    showGameOver: showGameOver, inningText: inningText, Sfx: Sfx
   };
 })();
